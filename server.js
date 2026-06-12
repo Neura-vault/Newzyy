@@ -142,7 +142,7 @@ app.post('/send-otp', async (req, res) => {
 
     // ── Send via Resend ──
     const { data, error } = await resend.emails.send({
-      from: 'Newzyy <onboarding@resend.dev>',   // Use your verified domain in production
+      from: `Newzyy <${process.env.FROM_EMAIL || 'onboarding@resend.dev'}>`,   // Use your verified domain in production
       to:   [email],
       subject,
       html: htmlBody
