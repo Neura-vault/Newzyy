@@ -1,15 +1,19 @@
 // ════════════════════════════════════════════════════════════
-//  NEWZYY  —  OTP Backend + Auto News Fetcher
+//  NEWZYY  —  OTP Backend + Auto News Fetcher (Fixed for Render)
 //  Start:  node server.js
 // ════════════════════════════════════════════════════════════
 
 const fetch = require('node-fetch');
 const express = require('express');
 const cors = require('cors');
+const fs = require('fs');
 const { Resend } = require('resend');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
+
+// ── File path for storing articles (Render disk) ──────────
+const ARTICLES_FILE = '/tmp/nzy_articles.json';
 
 // ── API Keys ────────────────────────────────────────────────
 const RESEND_API_KEY = process.env.RESEND_API_KEY || 're_S4GytVCQ_BXV1iiAnkMcMzrWi79PJFR8S';
@@ -44,6 +48,15 @@ app.use(express.json());
 // ════════════════════════════════════════════════════════════
 app.get('/', (req, res) => {
   res.json({ status: 'ok', service: 'Newzyy OTP + News API', time: new Date().toISOString() });
+});
+
+// ════════════════════════════════════════════════════════════
+//  MANUAL NEWS FETCH (Optional - for testing)
+// ════════════════════════════════════════════════════════════
+app.get('/manual-news', async (req, res) => {
+  console.log('📰 Manual news fetch triggered');
+  await fetchAutoNews();
+  res.json({ success: true, message: 'News fetch completed' });
 });
 
 // ════════════════════════════════════════════════════════════
@@ -158,7 +171,7 @@ app.post('/verify-otp', (req, res) => {
 });
 
 // ════════════════════════════════════════════════════════════
-//  AUTO NEWS FETCHER
+//  AUTO NEWS FETCHER (Fixed - No localStorage)
 // ════════════════════════════════════════════════════════════
 
 const CATEGORIES = ['technology', 'sports', 'business', 'health', 'politics', 'science', 'entertainment'];
@@ -180,6 +193,17 @@ async function fetchAutoNews() {
   console.log(`\n🔄 [${new Date().toLocaleTimeString()}] Starting news fetch...`);
   let totalNew = 0;
 
+  // Read existing articles from disk
+  let existing = [];
+  try {
+    const data = fs.readFileSync(ARTICLES_FILE, 'utf8');
+    existing = JSON.parse(data);
+    console.log(`📚 Loaded ${existing.length} existing articles from disk`);
+  } catch(e) {
+    console.log('📚 No existing articles found, starting fresh');
+    existing = [];
+  }
+
   for (const cat of CATEGORIES) {
     const url = `https://newsapi.org/v2/top-headlines?category=${cat}&language=en&apiKey=${NEWS_API_KEY}&pageSize=10`;
 
@@ -195,11 +219,6 @@ async function fetchAutoNews() {
       const articles = data.articles.filter(a => a.title && a.title !== '[Removed]' && a.description);
       console.log(`✅ ${cat}: ${articles.length} articles`);
 
-      let existing = [];
-      try {
-        existing = JSON.parse(localStorage.getItem('nzy_articles') || '[]');
-      } catch(e) { existing = []; }
-
       let newCount = 0;
 
       for (const article of articles) {
@@ -214,10 +233,10 @@ async function fetchAutoNews() {
             editor: false,
             title: article.title,
             excerpt: (article.description || '').substring(0, 180),
-            body: `<p>${article.description || ''}</p><p><a href="${article.url}" target="_blank">Read full article →</a></p>`,
+            body: `<p>${article.description || ''}</p><p><a href="${article.url}" target="_blank" style="color:#e8380d;">📖 Read full article →</a></p>`,
             author: article.author || 'NewsAPI',
             time: 'Just now',
-            views: Math.floor(Math.random() * 5000),
+            views: Math.floor(Math.random() * 5000) + 100,
             comments: Math.floor(Math.random() * 200),
             image: article.urlToImage || getCategoryImage(cat),
             status: 'pending',
@@ -231,7 +250,8 @@ async function fetchAutoNews() {
       }
 
       if (newCount > 0) {
-        localStorage.setItem('nzy_articles', JSON.stringify(existing));
+        // Save to disk
+        fs.writeFileSync(ARTICLES_FILE, JSON.stringify(existing));
         console.log(`📰 ${cat}: ${newCount} new articles added`);
       }
 
@@ -243,7 +263,7 @@ async function fetchAutoNews() {
   }
 
   console.log(`📰 TOTAL: ${totalNew} new articles`);
-  console.log(`✅ News fetch completed\n`);
+  console.log(`✅ News fetch completed at ${new Date().toLocaleTimeString()}\n`);
 }
 
 // ════════════════════════════════════════════════════════════
@@ -264,5 +284,6 @@ app.listen(PORT, () => {
   console.log(`\n🚀 Server running on port ${PORT}`);
   console.log(`   POST /send-otp`);
   console.log(`   POST /verify-otp`);
+  console.log(`   GET  /manual-news - Force news fetch`);
   console.log(`   Auto news every 6 hours\n`);
 });
