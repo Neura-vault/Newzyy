@@ -1,19 +1,6 @@
 // ════════════════════════════════════════════════════════════
-//  NEWZYY  —  OTP Backend  (Node.js + Express + Resend API)
-//  Start:  node server.js
-//  Port:   3001  (change PORT env var to override)
-// ════════════════════════════════════════════════════════════
-
-const express  = require('express');
-const cors     = require('cors');
-const { Resend } = require('resend');
-
-const app  = express();
-const PORT = process.env.PORT || 3001;
-// ════════════════════════════════════════════════════════════
 //  NEWZYY  —  OTP Backend + Auto News Fetcher
 //  Start:  node server.js
-//  Port:   3001 (or Render port)
 // ════════════════════════════════════════════════════════════
 
 const fetch = require('node-fetch');
@@ -26,7 +13,7 @@ const PORT = process.env.PORT || 3001;
 
 // ── API Keys ────────────────────────────────────────────────
 const RESEND_API_KEY = process.env.RESEND_API_KEY || 're_S4GytVCQ_BXV1iiAnkMcMzrWi79PJFR8S';
-const NEWS_API_KEY = process.env.NEWS_API_KEY || '3d1c54f463114aa7b89add3425c96029';  // ← Apni NewsAPI key yahan daalo
+const NEWS_API_KEY = process.env.NEWS_API_KEY || '3d1c54f463114aa7b89add3425c96029';
 
 const resend = new Resend(RESEND_API_KEY);
 
@@ -94,59 +81,18 @@ app.post('/send-otp', async (req, res) => {
       ? `${code} — Your Newzyy Verification Code`
       : `${code} — Confirm Your Newzyy Sign In`;
 
-    const htmlBody = `
-<!DOCTYPE html>
+    const htmlBody = `<!DOCTYPE html>
 <html>
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1">
-  <style>
-    body { margin:0; padding:0; background:#f7f7f5; font-family:'Helvetica Neue',Arial,sans-serif; }
-    .wrap { max-width:520px; margin:40px auto; background:#fff; border-radius:16px; overflow:hidden; box-shadow:0 4px 24px rgba(0,0,0,.08); }
-    .header { background:#0f0f0f; padding:32px; text-align:center; }
-    .logo { font-size:2rem; font-weight:900; color:#fff; letter-spacing:-1px; }
-    .logo span { color:#e8380d; }
-    .body { padding:40px 36px; }
-    .greeting { font-size:1rem; color:#4a4a4a; margin-bottom:8px; }
-    .headline { font-size:1.35rem; font-weight:700; color:#0f0f0f; margin-bottom:24px; line-height:1.3; }
-    .code-box { background:#f7f7f5; border:2px dashed #e8380d; border-radius:12px; padding:28px; text-align:center; margin:24px 0; }
-    .code { font-size:3rem; font-weight:900; letter-spacing:12px; color:#e8380d; font-family:'Courier New',monospace; }
-    .expiry { font-size:.82rem; color:#8a8a8a; margin-top:10px; }
-    .note { background:#fff1ee; border-radius:8px; padding:14px 16px; font-size:.83rem; color:#4a4a4a; margin:20px 0; border-left:3px solid #e8380d; }
-    .footer { background:#f7f7f5; padding:24px 36px; text-align:center; font-size:.75rem; color:#aaa; border-top:1px solid #e8e4df; }
-    .footer a { color:#e8380d; text-decoration:none; }
-  </style>
-</head>
-<body>
-  <div class="wrap">
-    <div class="header">
-      <div class="logo">Newzy<span>y</span></div>
-    </div>
-    <div class="body">
-      <div class="greeting">Hi ${name},</div>
-      <div class="headline">${isSignup ? 'Verify your new account' : 'Confirm your sign in'}</div>
-      <p style="font-size:.9rem;color:#4a4a4a;line-height:1.6">
-        ${isSignup
-          ? 'Welcome to Newzyy! Enter the code below to confirm your email and activate your account.'
-          : 'Someone (hopefully you!) is signing in to Newzyy. Enter this code to confirm.'}
-      </p>
-      <div class="code-box">
-        <div class="code">${code}</div>
-        <div class="expiry">⏱ Expires in 5 minutes</div>
-      </div>
-      <div class="note">
-        🔒 <strong>Security tip:</strong> Never share this code with anyone. Newzyy will never ask for your code.
-      </div>
-      <p style="font-size:.83rem;color:#8a8a8a;line-height:1.6">
-        If you didn't request this, you can safely ignore this email.
-      </p>
-    </div>
-    <div class="footer">
-      © 2026 Newzyy — Independent journalism, always.
-    </div>
-  </div>
-</body>
-</html>`;
+<head><meta charset="UTF-8"></head>
+<body style="font-family:Arial;padding:20px">
+<div style="max-width:500px;margin:0 auto;background:#fff;border-radius:12px;border:1px solid #e8e4df">
+<div style="background:#0f0f0f;padding:24px;text-align:center"><h1 style="color:#fff">Newzy<span style="color:#e8380d">y</span></h1></div>
+<div style="padding:32px">
+<h2>Hi ${name},</h2>
+<p>Your verification code is:</p>
+<div style="background:#f7f7f5;padding:20px;text-align:center;font-size:32px;letter-spacing:8px;font-weight:bold">${code}</div>
+<p>Expires in 5 minutes.</p>
+</div></div></body></html>`;
 
     const { data, error } = await resend.emails.send({
       from: `Newzyy <${process.env.FROM_EMAIL || 'onboarding@resend.dev'}>`,
@@ -157,15 +103,15 @@ app.post('/send-otp', async (req, res) => {
 
     if (error) {
       console.error('Resend error:', error);
-      return res.status(500).json({ success: false, message: 'Failed to send email. Please try again.' });
+      return res.status(500).json({ success: false, message: 'Failed to send email.' });
     }
 
     console.log(`OTP sent to ${email} | code: ${code}`);
-    res.json({ success: true, message: 'Verification code sent to your email.' });
+    res.json({ success: true, message: 'Verification code sent!' });
 
   } catch (err) {
-    console.error('Server error:', err);
-    res.status(500).json({ success: false, message: 'Server error. Please try again.' });
+    console.error('Error:', err);
+    res.status(500).json({ success: false, message: 'Server error.' });
   }
 });
 
@@ -177,59 +123,42 @@ app.post('/verify-otp', (req, res) => {
     const { email, code } = req.body;
 
     if (!email || !code) {
-      return res.status(400).json({ success: false, message: 'Email and code are required.' });
+      return res.status(400).json({ success: false, message: 'Email and code required.' });
     }
 
     const record = otpStore[email.toLowerCase()];
 
     if (!record) {
-      return res.status(400).json({
-        success: false,
-        message: 'No verification code found. Please request a new one.'
-      });
+      return res.status(400).json({ success: false, message: 'No code found. Request a new one.' });
     }
 
     if (Date.now() > record.expiresAt) {
       delete otpStore[email.toLowerCase()];
-      return res.status(400).json({
-        success: false,
-        message: 'Code expired. Please request a new one.',
-        expired: true
-      });
+      return res.status(400).json({ success: false, message: 'Code expired.', expired: true });
     }
 
     if (record.attempts >= MAX_ATTEMPTS) {
       delete otpStore[email.toLowerCase()];
-      return res.status(429).json({
-        success: false,
-        message: 'Too many attempts. Please request a new code.',
-        locked: true
-      });
+      return res.status(429).json({ success: false, message: 'Too many attempts.' });
     }
 
     if (String(code).trim() !== String(record.code)) {
       record.attempts++;
-      const remaining = MAX_ATTEMPTS - record.attempts;
-      return res.status(400).json({
-        success: false,
-        message: remaining > 0
-          ? `Incorrect code. ${remaining} attempt${remaining !== 1 ? 's' : ''} remaining.`
-          : 'Too many attempts. Please request a new code.'
-      });
+      return res.status(400).json({ success: false, message: `Incorrect code. ${MAX_ATTEMPTS - record.attempts} attempts left.` });
     }
 
     delete otpStore[email.toLowerCase()];
     console.log(`OTP verified for ${email}`);
-    res.json({ success: true, message: 'Email verified successfully.' });
+    res.json({ success: true, message: 'Email verified!' });
 
   } catch (err) {
-    console.error('Verify error:', err);
+    console.error('Error:', err);
     res.status(500).json({ success: false, message: 'Server error.' });
   }
 });
 
 // ════════════════════════════════════════════════════════════
-//  AUTO NEWS FETCHER (Every 6 Hours)
+//  AUTO NEWS FETCHER
 // ════════════════════════════════════════════════════════════
 
 const CATEGORIES = ['technology', 'sports', 'business', 'health', 'politics', 'science', 'entertainment'];
@@ -252,7 +181,7 @@ async function fetchAutoNews() {
   let totalNew = 0;
 
   for (const cat of CATEGORIES) {
-    const url = `https://newsapi.org/v2/top-headlines?category=${cat}&language=en&apiKey=${NEWS_API_KEY}&pageSize=15`;
+    const url = `https://newsapi.org/v2/top-headlines?category=${cat}&language=en&apiKey=${NEWS_API_KEY}&pageSize=10`;
 
     try {
       const response = await fetch(url);
@@ -266,18 +195,14 @@ async function fetchAutoNews() {
       const articles = data.articles.filter(a => a.title && a.title !== '[Removed]' && a.description);
       console.log(`✅ ${cat}: ${articles.length} articles`);
 
-      // Get existing articles
       let existing = [];
       try {
         existing = JSON.parse(localStorage.getItem('nzy_articles') || '[]');
-      } catch (e) {
-        existing = [];
-      }
+      } catch(e) { existing = []; }
 
       let newCount = 0;
 
       for (const article of articles) {
-        // Check for duplicate (by title)
         const isDuplicate = existing.some(a => a.title === article.title);
 
         if (!isDuplicate) {
@@ -289,10 +214,10 @@ async function fetchAutoNews() {
             editor: false,
             title: article.title,
             excerpt: (article.description || '').substring(0, 180),
-            body: `<p>${article.description || ''}</p><p><a href="${article.url}" target="_blank" style="color:#e8380d;">📖 Read full article on source →</a></p>`,
+            body: `<p>${article.description || ''}</p><p><a href="${article.url}" target="_blank">Read full article →</a></p>`,
             author: article.author || 'NewsAPI',
             time: 'Just now',
-            views: Math.floor(Math.random() * 5000) + 100,
+            views: Math.floor(Math.random() * 5000),
             comments: Math.floor(Math.random() * 200),
             image: article.urlToImage || getCategoryImage(cat),
             status: 'pending',
@@ -314,22 +239,21 @@ async function fetchAutoNews() {
       console.log(`❌ ${cat}: Error - ${err.message}`);
     }
 
-    // Delay to avoid rate limiting
     await new Promise(r => setTimeout(r, 300));
   }
 
-  console.log(`📰 TOTAL: ${totalNew} new articles fetched`);
-  console.log(`✅ News fetch completed at ${new Date().toLocaleTimeString()}\n`);
+  console.log(`📰 TOTAL: ${totalNew} new articles`);
+  console.log(`✅ News fetch completed\n`);
 }
 
 // ════════════════════════════════════════════════════════════
-//  START AUTO NEWS SCHEDULE
+//  START SCHEDULE
 // ════════════════════════════════════════════════════════════
 console.log('📰 Initializing auto news fetcher...');
 fetchAutoNews().catch(console.error);
 
 setInterval(async () => {
-  console.log('⏰ Scheduled news fetch starting...');
+  console.log('⏰ Scheduled news fetch...');
   await fetchAutoNews().catch(console.error);
 }, 6 * 60 * 60 * 1000);
 
@@ -337,231 +261,8 @@ setInterval(async () => {
 //  START SERVER
 // ════════════════════════════════════════════════════════════
 app.listen(PORT, () => {
-  console.log(`\n🚀 Newzyy OTP server running at http://localhost:${PORT}`);
-  console.log(`   POST /send-otp    — Send OTP to email`);
-  console.log(`   POST /verify-otp  — Verify OTP code`);
-  console.log(`   Auto news fetcher — Every 6 hours\n`);
-});
-// ── Resend client ──────────────────────────────────────────
-// Replace with your actual API key or set env var RESEND_API_KEY
-const RESEND_API_KEY = process.env.RESEND_API_KEY || 're_S4GytVCQ_BXV1iiAnkMcMzrWi79PJFR8S';
-const resend = new Resend(RESEND_API_KEY);
-
-// ── In-memory OTP store ───────────────────────────────────
-// { email: { code, expiresAt, attempts } }
-const otpStore = {};
-const OTP_EXPIRY_MS   = 5 * 60 * 1000;   // 5 minutes
-const MAX_ATTEMPTS    = 5;                 // wrong tries before lock
-const RATE_LIMIT_MS   = 60 * 1000;        // 1 resend per minute
-
-// ── Cleanup expired OTPs every 10 min ────────────────────
-setInterval(() => {
-  const now = Date.now();
-  for (const email in otpStore) {
-    if (otpStore[email].expiresAt < now) delete otpStore[email];
-  }
-}, 10 * 60 * 1000);
-
-// ── Middleware ─────────────────────────────────────────────
-app.use(cors({
-  origin: '*',          // In production, restrict to your domain
-  methods: ['GET','POST','OPTIONS'],
-  allowedHeaders: ['Content-Type']
-}));
-app.use(express.json());
-
-// ── Health check ───────────────────────────────────────────
-app.get('/', (req, res) => {
-  res.json({ status: 'ok', service: 'Newzyy OTP API', time: new Date().toISOString() });
-});
-
-// ══════════════════════════════════════════════════════════
-//  POST /send-otp
-//  Body: { email: string, type: 'signup' | 'login', name?: string }
-// ══════════════════════════════════════════════════════════
-app.post('/send-otp', async (req, res) => {
-  try {
-    const { email, type = 'signup', name = 'User' } = req.body;
-
-    // ── Validate email ──
-    if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
-      return res.status(400).json({ success: false, message: 'Invalid email address.' });
-    }
-
-    // ── Rate-limit: block rapid resend ──
-    const existing = otpStore[email.toLowerCase()];
-    if (existing && existing.sentAt && (Date.now() - existing.sentAt) < RATE_LIMIT_MS) {
-      const wait = Math.ceil((RATE_LIMIT_MS - (Date.now() - existing.sentAt)) / 1000);
-      return res.status(429).json({
-        success: false,
-        message: `Please wait ${wait} seconds before requesting another code.`
-      });
-    }
-
-    // ── Generate 6-digit code ──
-    const code = String(Math.floor(100000 + Math.random() * 900000));
-
-    // ── Store OTP ──
-    otpStore[email.toLowerCase()] = {
-      code,
-      expiresAt: Date.now() + OTP_EXPIRY_MS,
-      sentAt: Date.now(),
-      attempts: 0,
-      type
-    };
-
-    // ── Build beautiful HTML email ──
-    const isSignup = type === 'signup';
-    const subject  = isSignup
-      ? `${code} — Your Newzyy Verification Code`
-      : `${code} — Confirm Your Newzyy Sign In`;
-
-    const htmlBody = `
-<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1">
-  <style>
-    body { margin:0; padding:0; background:#f7f7f5; font-family:'Helvetica Neue',Arial,sans-serif; }
-    .wrap { max-width:520px; margin:40px auto; background:#fff; border-radius:16px; overflow:hidden; box-shadow:0 4px 24px rgba(0,0,0,.08); }
-    .header { background:#0f0f0f; padding:32px; text-align:center; }
-    .logo { font-size:2rem; font-weight:900; color:#fff; letter-spacing:-1px; }
-    .logo span { color:#e8380d; }
-    .body { padding:40px 36px; }
-    .greeting { font-size:1rem; color:#4a4a4a; margin-bottom:8px; }
-    .headline { font-size:1.35rem; font-weight:700; color:#0f0f0f; margin-bottom:24px; line-height:1.3; }
-    .code-box { background:#f7f7f5; border:2px dashed #e8380d; border-radius:12px; padding:28px; text-align:center; margin:24px 0; }
-    .code { font-size:3rem; font-weight:900; letter-spacing:12px; color:#e8380d; font-family:'Courier New',monospace; }
-    .expiry { font-size:.82rem; color:#8a8a8a; margin-top:10px; }
-    .note { background:#fff1ee; border-radius:8px; padding:14px 16px; font-size:.83rem; color:#4a4a4a; margin:20px 0; border-left:3px solid #e8380d; }
-    .footer { background:#f7f7f5; padding:24px 36px; text-align:center; font-size:.75rem; color:#aaa; border-top:1px solid #e8e4df; }
-    .footer a { color:#e8380d; text-decoration:none; }
-  </style>
-</head>
-<body>
-  <div class="wrap">
-    <div class="header">
-      <div class="logo">Newzy<span>y</span></div>
-    </div>
-    <div class="body">
-      <div class="greeting">Hi ${name},</div>
-      <div class="headline">${isSignup ? 'Verify your new account' : 'Confirm your sign in'}</div>
-      <p style="font-size:.9rem;color:#4a4a4a;line-height:1.6">
-        ${isSignup
-          ? 'Welcome to Newzyy! Enter the code below to confirm your email and activate your account.'
-          : 'Someone (hopefully you!) is signing in to Newzyy. Enter this code to confirm.'}
-      </p>
-      <div class="code-box">
-        <div class="code">${code}</div>
-        <div class="expiry">⏱ Expires in 5 minutes</div>
-      </div>
-      <div class="note">
-        🔒 <strong>Security tip:</strong> Never share this code with anyone. Newzyy will never ask for your code via phone or chat.
-      </div>
-      <p style="font-size:.83rem;color:#8a8a8a;line-height:1.6">
-        If you didn't request this, you can safely ignore this email. Your account remains secure.
-      </p>
-    </div>
-    <div class="footer">
-      © 2026 Newzyy — Independent journalism, always.<br>
-      <a href="#">Unsubscribe</a> · <a href="#">Privacy Policy</a>
-    </div>
-  </div>
-</body>
-</html>`;
-
-    // ── Send via Resend ──
-    const { data, error } = await resend.emails.send({
-      from: `Newzyy <${process.env.FROM_EMAIL || 'onboarding@resend.dev'}>`,   // Use your verified domain in production
-      to:   [email],
-      subject,
-      html: htmlBody
-    });
-
-    if (error) {
-      console.error('Resend error:', error);
-      return res.status(500).json({ success: false, message: 'Failed to send email. Please try again.' });
-    }
-
-    console.log(`OTP sent to ${email} | code: ${code} | id: ${data?.id}`);
-    res.json({ success: true, message: 'Verification code sent to your email.' });
-
-  } catch (err) {
-    console.error('Server error:', err);
-    res.status(500).json({ success: false, message: 'Server error. Please try again.' });
-  }
-});
-
-// ══════════════════════════════════════════════════════════
-//  POST /verify-otp
-//  Body: { email: string, code: string }
-// ══════════════════════════════════════════════════════════
-app.post('/verify-otp', (req, res) => {
-  try {
-    const { email, code } = req.body;
-
-    if (!email || !code) {
-      return res.status(400).json({ success: false, message: 'Email and code are required.' });
-    }
-
-    const record = otpStore[email.toLowerCase()];
-
-    // ── OTP not found ──
-    if (!record) {
-      return res.status(400).json({
-        success: false,
-        message: 'No verification code found for this email. Please request a new one.'
-      });
-    }
-
-    // ── Expired ──
-    if (Date.now() > record.expiresAt) {
-      delete otpStore[email.toLowerCase()];
-      return res.status(400).json({
-        success: false,
-        message: 'Your code has expired. Please request a new one.',
-        expired: true
-      });
-    }
-
-    // ── Too many attempts ──
-    if (record.attempts >= MAX_ATTEMPTS) {
-      delete otpStore[email.toLowerCase()];
-      return res.status(429).json({
-        success: false,
-        message: 'Too many incorrect attempts. Please request a new code.',
-        locked: true
-      });
-    }
-
-    // ── Wrong code ──
-    if (String(code).trim() !== String(record.code)) {
-      record.attempts++;
-      const remaining = MAX_ATTEMPTS - record.attempts;
-      return res.status(400).json({
-        success: false,
-        message: remaining > 0
-          ? `Incorrect code. ${remaining} attempt${remaining !== 1 ? 's' : ''} remaining.`
-          : 'Too many incorrect attempts. Please request a new code.',
-        attemptsLeft: remaining
-      });
-    }
-
-    // ── ✅ CORRECT ──
-    delete otpStore[email.toLowerCase()];
-    console.log(`OTP verified for ${email}`);
-    res.json({ success: true, message: 'Email verified successfully.' });
-
-  } catch (err) {
-    console.error('Verify error:', err);
-    res.status(500).json({ success: false, message: 'Server error. Please try again.' });
-  }
-});
-
-// ── Start server ───────────────────────────────────────────
-app.listen(PORT, () => {
-  console.log(`\n🚀 Newzyy OTP server running at http://localhost:${PORT}`);
-  console.log(`   POST /send-otp    — Send OTP to email`);
-  console.log(`   POST /verify-otp  — Verify OTP code\n`);
+  console.log(`\n🚀 Server running on port ${PORT}`);
+  console.log(`   POST /send-otp`);
+  console.log(`   POST /verify-otp`);
+  console.log(`   Auto news every 6 hours\n`);
 });
