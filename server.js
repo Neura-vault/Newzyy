@@ -1,6 +1,5 @@
 // ════════════════════════════════════════════════════════════
-//  NEWZYY  —  OTP Backend + Auto News Fetcher (Fixed for Render)
-//  Start:  node server.js
+//  NEWZYY  —  OTP Backend + Auto News Fetcher + API
 // ════════════════════════════════════════════════════════════
 
 const fetch = require('node-fetch');
@@ -51,12 +50,72 @@ app.get('/', (req, res) => {
 });
 
 // ════════════════════════════════════════════════════════════
-//  MANUAL NEWS FETCH (Optional - for testing)
+//  API: GET PENDING NEWS (For Admin Panel)
 // ════════════════════════════════════════════════════════════
-app.get('/manual-news', async (req, res) => {
-  console.log('📰 Manual news fetch triggered');
-  await fetchAutoNews();
-  res.json({ success: true, message: 'News fetch completed' });
+app.get('/api/pending-news', (req, res) => {
+  try {
+    if (!fs.existsSync(ARTICLES_FILE)) {
+      return res.json({ success: true, news: [] });
+    }
+    const data = fs.readFileSync(ARTICLES_FILE, 'utf8');
+    const articles = JSON.parse(data);
+    const pending = articles.filter(a => a.status === 'pending');
+    console.log(`📡 API: Sending ${pending.length} pending news`);
+    res.json({ success: true, news: pending });
+  } catch(e) {
+    console.error('API Error:', e.message);
+    res.json({ success: true, news: [] });
+  }
+});
+
+// ════════════════════════════════════════════════════════════
+//  API: APPROVE NEWS (From Admin Panel)
+// ════════════════════════════════════════════════════════════
+app.post('/api/approve-news', (req, res) => {
+  try {
+    const { id } = req.body;
+    if (!id) {
+      return res.json({ success: false, message: 'ID required' });
+    }
+    
+    const data = fs.readFileSync(ARTICLES_FILE, 'utf8');
+    let articles = JSON.parse(data);
+    const index = articles.findIndex(a => a.id === id);
+    
+    if (index !== -1) {
+      articles[index].status = 'published';
+      fs.writeFileSync(ARTICLES_FILE, JSON.stringify(articles));
+      console.log(`✅ API: Approved news ${id}`);
+      res.json({ success: true });
+    } else {
+      res.json({ success: false, message: 'News not found' });
+    }
+  } catch(e) {
+    console.error('Approve Error:', e.message);
+    res.json({ success: false, message: e.message });
+  }
+});
+
+// ════════════════════════════════════════════════════════════
+//  API: APPROVE ALL PENDING NEWS
+// ════════════════════════════════════════════════════════════
+app.post('/api/approve-all', (req, res) => {
+  try {
+    const data = fs.readFileSync(ARTICLES_FILE, 'utf8');
+    let articles = JSON.parse(data);
+    let count = 0;
+    articles.forEach(a => {
+      if (a.status === 'pending') {
+        a.status = 'published';
+        count++;
+      }
+    });
+    fs.writeFileSync(ARTICLES_FILE, JSON.stringify(articles));
+    console.log(`✅ API: Approved ${count} news articles`);
+    res.json({ success: true, count: count });
+  } catch(e) {
+    res.json({ success: false, message: e.message });
+  }
 });
 
 // ════════════════════════════════════════════════════════════
@@ -171,7 +230,7 @@ app.post('/verify-otp', (req, res) => {
 });
 
 // ════════════════════════════════════════════════════════════
-//  AUTO NEWS FETCHER (Fixed - No localStorage)
+//  AUTO NEWS FETCHER (Every 6 Hours)
 // ════════════════════════════════════════════════════════════
 
 const CATEGORIES = ['technology', 'sports', 'business', 'health', 'politics', 'science', 'entertainment'];
@@ -193,16 +252,14 @@ async function fetchAutoNews() {
   console.log(`\n🔄 [${new Date().toLocaleTimeString()}] Starting news fetch...`);
   let totalNew = 0;
 
-  // Read existing articles from disk
   let existing = [];
   try {
-    const data = fs.readFileSync(ARTICLES_FILE, 'utf8');
-    existing = JSON.parse(data);
-    console.log(`📚 Loaded ${existing.length} existing articles from disk`);
-  } catch(e) {
-    console.log('📚 No existing articles found, starting fresh');
-    existing = [];
-  }
+    if (fs.existsSync(ARTICLES_FILE)) {
+      const data = fs.readFileSync(ARTICLES_FILE, 'utf8');
+      existing = JSON.parse(data);
+      console.log(`📚 Loaded ${existing.length} existing articles`);
+    }
+  } catch(e) { existing = []; }
 
   for (const cat of CATEGORIES) {
     const url = `https://newsapi.org/v2/top-headlines?category=${cat}&language=en&apiKey=${NEWS_API_KEY}&pageSize=10`;
@@ -233,7 +290,7 @@ async function fetchAutoNews() {
             editor: false,
             title: article.title,
             excerpt: (article.description || '').substring(0, 180),
-            body: `<p>${article.description || ''}</p><p><a href="${article.url}" target="_blank" style="color:#e8380d;">📖 Read full article →</a></p>`,
+            body: `<p>${article.description || ''}</p><p><a href="${article.url}" target="_blank" style="color:#e8380d;">📖 Read full article on source →</a></p>`,
             author: article.author || 'NewsAPI',
             time: 'Just now',
             views: Math.floor(Math.random() * 5000) + 100,
@@ -250,7 +307,6 @@ async function fetchAutoNews() {
       }
 
       if (newCount > 0) {
-        // Save to disk
         fs.writeFileSync(ARTICLES_FILE, JSON.stringify(existing));
         console.log(`📰 ${cat}: ${newCount} new articles added`);
       }
@@ -284,6 +340,8 @@ app.listen(PORT, () => {
   console.log(`\n🚀 Server running on port ${PORT}`);
   console.log(`   POST /send-otp`);
   console.log(`   POST /verify-otp`);
-  console.log(`   GET  /manual-news - Force news fetch`);
+  console.log(`   GET  /api/pending-news`);
+  console.log(`   POST /api/approve-news`);
+  console.log(`   POST /api/approve-all`);
   console.log(`   Auto news every 6 hours\n`);
 });
