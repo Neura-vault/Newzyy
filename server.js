@@ -280,6 +280,7 @@ async function fetchAutoNews() {
 
       for (const article of articles) {
         const isDuplicate = existing.some(a => a.title === article.title);
+        console.log(`Checking: ${article.title} | Duplicate: ${isDuplicate}`);
 
         if (!isDuplicate) {
           const newArticle = {
