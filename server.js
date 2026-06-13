@@ -251,7 +251,16 @@ async function fetchAllNewsMultiAPI() {
 
   let totalNew = 0;
   const existingTitles = new Set(existing.map(a => a.title?.toLowerCase()));
-
+// Stronger duplicate check - by title + url
+function isDuplicateArticle(article, existing) {
+  const titleLower = article.title?.toLowerCase();
+  const urlLower = article.url?.toLowerCase();
+  return existing.some(a => 
+    a.title?.toLowerCase() === titleLower ||
+    a.source_url?.toLowerCase() === urlLower ||
+    (a.title?.toLowerCase().includes(titleLower?.substring(0, 30)) && titleLower?.length > 30)
+  );
+}
   for (const cat of CATEGORIES) {
     console.log(`\n📰 Fetching ${cat}...`);
     
@@ -271,7 +280,7 @@ async function fetchAllNewsMultiAPI() {
       if (!article.title) continue;
       const titleLower = article.title.toLowerCase();
       
-      if (!existingTitles.has(titleLower)) {
+      if (!isDuplicateArticle(article, existing)) {
         const newArticle = {
           id: `auto_${Date.now()}_${Math.random().toString(36).substring(2, 10)}`,
           category: cat,
