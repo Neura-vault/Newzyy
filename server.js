@@ -18,8 +18,8 @@ const ARTICLES_FILE = '/tmp/nzy_articles.json';
 // API Keys
 const RESEND_API_KEY = process.env.RESEND_API_KEY || 're_S4GytVCQ_BXV1iiAnkMcMzrWi79PJFR8S';
 const NEWS_API_KEY = process.env.NEWS_API_KEY || '3d1c54f463114aa7b89add3425c96029';
-const GNEWS_API_KEY = process.env.GNEWS_API_KEY || 'YOUR_GNEWS_API_KEY_HERE';
-const CURRENTS_API_KEY = process.env.CURRENTS_API_KEY || 'YOUR_CURRENTS_API_KEY_HERE';
+const GNEWS_API_KEY = process.env.GNEWS_API_KEY || 'd1f847083123284d432ab28b413281c1';
+const CURRENTS_API_KEY = process.env.CURRENTS_API_KEY || 'kRjvwkCfg3uNzr1EYjYLSyTIatY-vq9FxxlBxt2Scb-JSfUu';
 
 const resend = new Resend(RESEND_API_KEY);
 
