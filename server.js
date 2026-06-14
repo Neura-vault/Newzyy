@@ -1,6 +1,6 @@
 // ════════════════════════════════════════════════════════════
-//  NEWZYY — Multi-API News Backend
-//  NewsAPI + GNews + Currents API
+//  NEWZYY — AUTO NEWS FETCHER + AUTO PUBLISH + AUTO DELETE
+//  No approval needed | Unlimited news | 5 days auto-cleanup
 // ════════════════════════════════════════════════════════════
 
 const fetch = require('node-fetch');
@@ -43,52 +43,36 @@ app.use(express.json());
 
 // Health check
 app.get('/', (req, res) => {
-  res.json({ status: 'ok', service: 'Newzyy Multi-API News', time: new Date().toISOString() });
+  res.json({ status: 'ok', service: 'Newzyy Auto News API', time: new Date().toISOString() });
 });
 
-// Get pending news
-app.get('/api/pending-news', (req, res) => {
+// Get ALL published news (unlimited)
+app.get('/api/all-news', (req, res) => {
   try {
     if (!fs.existsSync(ARTICLES_FILE)) return res.json({ success: true, news: [] });
     const data = fs.readFileSync(ARTICLES_FILE, 'utf8');
-    const articles = JSON.parse(data);
-    const pending = articles.filter(a => a.status === 'pending');
-    res.json({ success: true, news: pending });
+    let articles = JSON.parse(data);
+    // Filter only published, sort by date (latest first)
+    articles = articles.filter(a => a.status === 'published');
+    articles.sort((a, b) => new Date(b.fetched_at || b.id) - new Date(a.fetched_at || a.id));
+    res.json({ success: true, news: articles });
   } catch(e) {
     res.json({ success: true, news: [] });
   }
 });
 
-// Approve news
-app.post('/api/approve-news', (req, res) => {
+// Get latest news only (for homepage)
+app.get('/api/latest-news', (req, res) => {
   try {
-    const { id } = req.body;
+    if (!fs.existsSync(ARTICLES_FILE)) return res.json({ success: true, news: [] });
     const data = fs.readFileSync(ARTICLES_FILE, 'utf8');
     let articles = JSON.parse(data);
-    const index = articles.findIndex(a => a.id === id);
-    if (index !== -1) {
-      articles[index].status = 'published';
-      fs.writeFileSync(ARTICLES_FILE, JSON.stringify(articles));
-      res.json({ success: true });
-    } else {
-      res.json({ success: false, message: 'Not found' });
-    }
+    articles = articles.filter(a => a.status === 'published');
+    articles.sort((a, b) => new Date(b.fetched_at || b.id) - new Date(a.fetched_at || a.id));
+    // Send all, frontend will handle display
+    res.json({ success: true, news: articles });
   } catch(e) {
-    res.json({ success: false, message: e.message });
-  }
-});
-
-// Approve all
-app.post('/api/approve-all', (req, res) => {
-  try {
-    const data = fs.readFileSync(ARTICLES_FILE, 'utf8');
-    let articles = JSON.parse(data);
-    let count = 0;
-    articles.forEach(a => { if (a.status === 'pending') { a.status = 'published'; count++; } });
-    fs.writeFileSync(ARTICLES_FILE, JSON.stringify(articles));
-    res.json({ success: true, count: count });
-  } catch(e) {
-    res.json({ success: false, message: e.message });
+    res.json({ success: true, news: [] });
   }
 });
 
@@ -146,7 +130,7 @@ app.post('/verify-otp', (req, res) => {
   }
 });
 
-// ========== MULTI-API NEWS FETCHER ==========
+// ========== AUTO NEWS FETCHER (No Approval + Auto Delete Old News) ==========
 
 const CATEGORIES = ['technology', 'sports', 'business', 'health', 'politics', 'science', 'entertainment'];
 
@@ -175,9 +159,26 @@ function formatTimeAgo(dateString) {
   return `${diffDays}d ago`;
 }
 
-// Fetch from NewsAPI
+// Auto delete news older than 5 days
+function deleteOldNews(articles) {
+  const fiveDaysAgo = new Date();
+  fiveDaysAgo.setDate(fiveDaysAgo.getDate() - 5);
+  
+  const beforeCount = articles.length;
+  const filtered = articles.filter(a => {
+    const newsDate = new Date(a.fetched_at || a.id);
+    return newsDate > fiveDaysAgo;
+  });
+  const deletedCount = beforeCount - filtered.length;
+  if (deletedCount > 0) {
+    console.log(`🗑️ Auto-deleted ${deletedCount} old news (older than 5 days)`);
+  }
+  return filtered;
+}
+
+// Fetch news from NewsAPI
 async function fetchFromNewsAPI(category) {
-  const url = `https://newsapi.org/v2/top-headlines?category=${category}&language=en&apiKey=${NEWS_API_KEY}&pageSize=8`;
+  const url = `https://newsapi.org/v2/top-headlines?category=${category}&language=en&apiKey=${NEWS_API_KEY}&pageSize=10`;
   try {
     const response = await fetch(url);
     const data = await response.json();
@@ -188,57 +189,14 @@ async function fetchFromNewsAPI(category) {
       url: a.url,
       image: a.urlToImage,
       author: a.author || 'NewsAPI',
-      publishedAt: a.publishedAt,
-      source: 'NewsAPI'
+      publishedAt: a.publishedAt || new Date().toISOString()
     }));
   } catch(e) { return []; }
 }
 
-// Fetch from GNews API
-async function fetchFromGNews(category) {
-  if (!GNEWS_API_KEY || GNEWS_API_KEY === 'YOUR_GNEWS_API_KEY_HERE') return [];
-  const url = `https://gnews.io/api/v4/top-headlines?category=${category}&lang=en&apikey=${GNEWS_API_KEY}&max=8`;
-  try {
-    const response = await fetch(url);
-    const data = await response.json();
-    if (!data.articles) return [];
-    return data.articles.map(a => ({
-      title: a.title,
-      description: a.description,
-      url: a.url,
-      image: a.image,
-      author: a.source?.name || 'GNews',
-      publishedAt: a.publishedAt,
-      source: 'GNews'
-    }));
-  } catch(e) { return []; }
-}
-
-// Fetch from Currents API
-async function fetchFromCurrents(category) {
-  if (!CURRENTS_API_KEY || CURRENTS_API_KEY === 'YOUR_CURRENTS_API_KEY_HERE') return [];
-  const categoryMap = { technology: 'tech', sports: 'sports', business: 'business', health: 'health', politics: 'politics', science: 'science', entertainment: 'entertainment' };
-  const cat = categoryMap[category] || category;
-  const url = `https://api.currentsapi.services/v1/latest-news?category=${cat}&language=en&apiKey=${CURRENTS_API_KEY}&page_size=8`;
-  try {
-    const response = await fetch(url);
-    const data = await response.json();
-    if (!data.news) return [];
-    return data.news.map(a => ({
-      title: a.title,
-      description: a.description,
-      url: a.url,
-      image: a.image || a.author_image,
-      author: a.author || 'Currents',
-      publishedAt: a.published,
-      source: 'Currents'
-    }));
-  } catch(e) { return []; }
-}
-
-// Fetch all news from all APIs
-async function fetchAllNewsMultiAPI() {
-  console.log(`\n🔄 [${new Date().toLocaleTimeString()}] Starting multi-API news fetch...`);
+// Fetch and save all news
+async function fetchAndSaveNews() {
+  console.log(`\n🔄 [${new Date().toLocaleTimeString()}] Starting auto news fetch...`);
   
   let existing = [];
   try {
@@ -251,53 +209,34 @@ async function fetchAllNewsMultiAPI() {
 
   let totalNew = 0;
   const existingTitles = new Set(existing.map(a => a.title?.toLowerCase()));
-// Stronger duplicate check - by title + url
-function isDuplicateArticle(article, existing) {
-  const titleLower = article.title?.toLowerCase();
-  const urlLower = article.url?.toLowerCase();
-  return existing.some(a => 
-    a.title?.toLowerCase() === titleLower ||
-    a.source_url?.toLowerCase() === urlLower ||
-    (a.title?.toLowerCase().includes(titleLower?.substring(0, 30)) && titleLower?.length > 30)
-  );
-}
+
   for (const cat of CATEGORIES) {
-    console.log(`\n📰 Fetching ${cat}...`);
-    
-    // Fetch from all 3 APIs
-    const [newsapi, gnews, currents] = await Promise.all([
-      fetchFromNewsAPI(cat),
-      fetchFromGNews(cat),
-      fetchFromCurrents(cat)
-    ]);
-    
-    const allArticles = [...newsapi, ...gnews, ...currents];
-    console.log(`   NewsAPI: ${newsapi.length}, GNews: ${gnews.length}, Currents: ${currents.length}, Total: ${allArticles.length}`);
+    const articles = await fetchFromNewsAPI(cat);
+    console.log(`📰 ${cat}: ${articles.length} articles from API`);
     
     let newCount = 0;
     
-    for (const article of allArticles) {
+    for (const article of articles) {
       if (!article.title) continue;
       const titleLower = article.title.toLowerCase();
       
-      if (!isDuplicateArticle(article, existing)) {
+      if (!existingTitles.has(titleLower)) {
         const newArticle = {
           id: `auto_${Date.now()}_${Math.random().toString(36).substring(2, 10)}`,
           category: cat,
           featured: false,
-          trending: Math.random() > 0.7,
+          trending: false,
           editor: false,
           title: article.title,
           excerpt: (article.description || '').substring(0, 180),
-          body: `<p>${article.description || ''}</p><p><a href="${article.url}" target="_blank" style="color:#e8380d;">📖 Read full article on ${article.source} →</a></p>`,
-          author: article.author || article.source,
+          body: `<p>${article.description || ''}</p><p><a href="${article.url}" target="_blank" style="color:#e8380d;">📖 Read full article →</a></p>`,
+          author: article.author,
           time: formatTimeAgo(article.publishedAt),
           views: Math.floor(Math.random() * 5000) + 100,
           comments: Math.floor(Math.random() * 200),
           image: article.image || getCategoryImage(cat),
-          status: 'pending',
+          status: 'published', // AUTO PUBLISH - NO APPROVAL NEEDED
           source_url: article.url,
-          source: article.source,
           fetched_at: new Date().toISOString()
         };
         existing.unshift(newArticle);
@@ -308,33 +247,59 @@ function isDuplicateArticle(article, existing) {
     }
     
     if (newCount > 0) {
-      fs.writeFileSync(ARTICLES_FILE, JSON.stringify(existing));
-      console.log(`   ✅ ${cat}: ${newCount} new articles added`);
+      console.log(`   ✅ ${cat}: ${newCount} new auto-published articles`);
     }
     
-    await new Promise(r => setTimeout(r, 500));
+    await new Promise(r => setTimeout(r, 300));
   }
   
-  console.log(`\n📰 TOTAL: ${totalNew} new articles fetched from all APIs`);
-  console.log(`✅ Multi-API fetch completed at ${new Date().toLocaleTimeString()}\n`);
+  // Delete old news (older than 5 days)
+  const beforeDelete = existing.length;
+  existing = deleteOldNews(existing);
+  
+  // Sort by date (latest first)
+  existing.sort((a, b) => new Date(b.fetched_at || b.id) - new Date(a.fetched_at || a.id));
+  
+  // Save to disk (unlimited - no limit)
+  fs.writeFileSync(ARTICLES_FILE, JSON.stringify(existing));
+  
+  console.log(`📊 SUMMARY: +${totalNew} new | -${beforeDelete - existing.length} deleted | Total: ${existing.length} articles`);
+  console.log(`✅ Auto fetch completed at ${new Date().toLocaleTimeString()}\n`);
 }
 
 // ========== START SCHEDULE ==========
-console.log('📰 Initializing multi-API news fetcher...');
-fetchAllNewsMultiAPI().catch(console.error);
+console.log('📰 Initializing auto news fetcher (auto-publish + auto-delete)...');
+fetchAndSaveNews().catch(console.error);
 
+// Run every 6 hours
 setInterval(async () => {
-  console.log('⏰ Scheduled news fetch...');
-  await fetchAllNewsMultiAPI().catch(console.error);
+  console.log('⏰ Scheduled auto news fetch...');
+  await fetchAndSaveNews().catch(console.error);
 }, 6 * 60 * 60 * 1000);
+
+// Also run cleanup every day at midnight
+setInterval(async () => {
+  console.log('🧹 Running auto-cleanup for old news...');
+  if (fs.existsSync(ARTICLES_FILE)) {
+    const data = fs.readFileSync(ARTICLES_FILE, 'utf8');
+    let articles = JSON.parse(data);
+    const before = articles.length;
+    articles = deleteOldNews(articles);
+    if (before !== articles.length) {
+      fs.writeFileSync(ARTICLES_FILE, JSON.stringify(articles));
+      console.log(`🧹 Cleanup complete: ${before} → ${articles.length} articles`);
+    }
+  }
+}, 24 * 60 * 60 * 1000); // Once per day
 
 // ========== START SERVER ==========
 app.listen(PORT, () => {
   console.log(`\n🚀 Server running on port ${PORT}`);
   console.log(`   POST /send-otp`);
   console.log(`   POST /verify-otp`);
-  console.log(`   GET  /api/pending-news`);
-  console.log(`   POST /api/approve-news`);
-  console.log(`   POST /api/approve-all`);
-  console.log(`   Multi-API news every 6 hours\n`);
+  console.log(`   GET  /api/all-news`);
+  console.log(`   GET  /api/latest-news`);
+  console.log(`   Auto fetch every 6 hours`);
+  console.log(`   Auto delete news older than 5 days`);
+  console.log(`   No approval needed — auto publish\n`);
 });
