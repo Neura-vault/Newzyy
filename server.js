@@ -1,6 +1,6 @@
 // ════════════════════════════════════════════════════════════
-//  NEWZYY — 4 APIs AUTO NEWS FETCHER
-//  NewsAPI + GNews + Currents + Existing
+//  NEWZYY — COMPLETE FIXED BACKEND
+//  4 APIs | 20 news per category | Auto delete 3 days old
 // ════════════════════════════════════════════════════════════
 
 const fetch = require('node-fetch');
@@ -12,7 +12,6 @@ const { Resend } = require('resend');
 const app = express();
 const PORT = process.env.PORT || 3001;
 
-// File path for storing articles
 const ARTICLES_FILE = '/tmp/nzy_articles.json';
 
 // API Keys
@@ -29,7 +28,6 @@ const OTP_EXPIRY_MS = 5 * 60 * 1000;
 const MAX_ATTEMPTS = 5;
 const RATE_LIMIT_MS = 60 * 1000;
 
-// Cleanup OTPs
 setInterval(() => {
   const now = Date.now();
   for (const email in otpStore) {
@@ -37,16 +35,13 @@ setInterval(() => {
   }
 }, 10 * 60 * 1000);
 
-// Middleware
 app.use(cors({ origin: '*', methods: ['GET', 'POST', 'OPTIONS'], allowedHeaders: ['Content-Type'] }));
 app.use(express.json());
 
-// Health check
 app.get('/', (req, res) => {
   res.json({ status: 'ok', service: 'Newzyy 4-API News', time: new Date().toISOString() });
 });
 
-// Get ALL published news
 app.get('/api/all-news', (req, res) => {
   try {
     if (!fs.existsSync(ARTICLES_FILE)) return res.json({ success: true, news: [] });
@@ -60,7 +55,6 @@ app.get('/api/all-news', (req, res) => {
   }
 });
 
-// Get latest news
 app.get('/api/latest-news', (req, res) => {
   try {
     if (!fs.existsSync(ARTICLES_FILE)) return res.json({ success: true, news: [] });
@@ -128,7 +122,7 @@ app.post('/verify-otp', (req, res) => {
   }
 });
 
-// ========== 4 APIs AUTO NEWS FETCHER ==========
+// ========== 4 APIs NEWS FETCHER ==========
 
 const CATEGORIES = ['technology', 'sports', 'business', 'health', 'politics', 'science', 'entertainment'];
 
@@ -157,9 +151,9 @@ function formatTimeAgo(dateString) {
   return `${diffDays}d ago`;
 }
 
-// API 1: NewsAPI
+// API 1: NewsAPI - 20 news per category
 async function fetchFromNewsAPI(category) {
-  const url = `https://newsapi.org/v2/top-headlines?category=${category}&language=en&apiKey=${NEWS_API_KEY}&pageSize=8`;
+  const url = `https://newsapi.org/v2/top-headlines?category=${category}&language=en&apiKey=${NEWS_API_KEY}&pageSize=20`;
   try {
     const response = await fetch(url);
     const data = await response.json();
@@ -176,10 +170,10 @@ async function fetchFromNewsAPI(category) {
   } catch(e) { return []; }
 }
 
-// API 2: GNews API
+// API 2: GNews API - 15 news per category
 async function fetchFromGNews(category) {
-  if (!GNEWS_API_KEY || GNEWS_API_KEY === 'YOUR_GNEWS_API_KEY_HERE') return [];
-  const url = `https://gnews.io/api/v4/top-headlines?category=${category}&lang=en&apikey=${GNEWS_API_KEY}&max=8`;
+  if (!GNEWS_API_KEY || GNEWS_API_KEY === 'd1f847083123284d432ab28b413281c1') return [];
+  const url = `https://gnews.io/api/v4/top-headlines?category=${category}&lang=en&apikey=${GNEWS_API_KEY}&max=15`;
   try {
     const response = await fetch(url);
     const data = await response.json();
@@ -196,12 +190,12 @@ async function fetchFromGNews(category) {
   } catch(e) { return []; }
 }
 
-// API 3: Currents API
+// API 3: Currents API - 15 news per category
 async function fetchFromCurrents(category) {
-  if (!CURRENTS_API_KEY || CURRENTS_API_KEY === 'YOUR_CURRENTS_API_KEY_HERE') return [];
+  if (!CURRENTS_API_KEY || CURRENTS_API_KEY === 'kRjvwkCfg3uNzr1EYjYLSyTIatY-vq9FxxlBxt2Scb-JSfUu') return [];
   const categoryMap = { technology: 'tech', sports: 'sports', business: 'business', health: 'health', politics: 'politics', science: 'science', entertainment: 'entertainment' };
   const cat = categoryMap[category] || category;
-  const url = `https://api.currentsapi.services/v1/latest-news?category=${cat}&language=en&apiKey=${CURRENTS_API_KEY}&page_size=8`;
+  const url = `https://api.currentsapi.services/v1/latest-news?category=${cat}&language=en&apiKey=${CURRENTS_API_KEY}&page_size=15`;
   try {
     const response = await fetch(url);
     const data = await response.json();
@@ -218,17 +212,17 @@ async function fetchFromCurrents(category) {
   } catch(e) { return []; }
 }
 
-// Auto delete news older than 5 days
+// Auto delete news older than 3 days
 function deleteOldNews(articles) {
-  const fiveDaysAgo = new Date();
-  fiveDaysAgo.setDate(fiveDaysAgo.getDate() - 5);
+  const threeDaysAgo = new Date();
+  threeDaysAgo.setDate(threeDaysAgo.getDate() - 3);
   const beforeCount = articles.length;
   const filtered = articles.filter(a => {
     const newsDate = new Date(a.fetched_at || a.id);
-    return newsDate > fiveDaysAgo;
+    return newsDate > threeDaysAgo;
   });
   const deletedCount = beforeCount - filtered.length;
-  if (deletedCount > 0) console.log(`🗑️ Auto-deleted ${deletedCount} old news (older than 5 days)`);
+  if (deletedCount > 0) console.log(`🗑️ Auto-deleted ${deletedCount} old news (older than 3 days)`);
   return filtered;
 }
 
@@ -251,7 +245,6 @@ async function fetchAllNewsMultiAPI() {
   for (const cat of CATEGORIES) {
     console.log(`\n📰 Fetching ${cat} from 4 APIs...`);
     
-    // Fetch from all 4 APIs
     const [newsapi, gnews, currents] = await Promise.all([
       fetchFromNewsAPI(cat),
       fetchFromGNews(cat),
@@ -271,7 +264,7 @@ async function fetchAllNewsMultiAPI() {
         const newArticle = {
           id: `auto_${Date.now()}_${Math.random().toString(36).substring(2, 10)}`,
           category: cat,
-          featured: false,
+          featured: cat === 'politics' && newCount === 0,
           trending: false,
           editor: false,
           title: article.title,
@@ -295,13 +288,13 @@ async function fetchAllNewsMultiAPI() {
     }
     
     if (newCount > 0) {
-      console.log(`   ✅ ${cat}: ${newCount} new articles added from 4 APIs`);
+      console.log(`   ✅ ${cat}: ${newCount} new articles added`);
     }
     
     await new Promise(r => setTimeout(r, 500));
   }
   
-  // Delete old news (older than 5 days)
+  // Delete old news (older than 3 days)
   const beforeDelete = existing.length;
   existing = deleteOldNews(existing);
   
@@ -316,16 +309,14 @@ async function fetchAllNewsMultiAPI() {
 }
 
 // ========== START SCHEDULE ==========
-console.log('📰 Initializing 4-API auto news fetcher (NewsAPI + GNews + Currents)...');
+console.log('📰 Initializing 4-API auto news fetcher...');
 fetchAllNewsMultiAPI().catch(console.error);
 
-// Run every 6 hours
 setInterval(async () => {
   console.log('⏰ Scheduled 4-API news fetch...');
   await fetchAllNewsMultiAPI().catch(console.error);
 }, 6 * 60 * 60 * 1000);
 
-// Cleanup daily
 setInterval(async () => {
   console.log('🧹 Running auto-cleanup for old news...');
   if (fs.existsSync(ARTICLES_FILE)) {
@@ -340,14 +331,9 @@ setInterval(async () => {
   }
 }, 24 * 60 * 60 * 1000);
 
-// ========== START SERVER ==========
 app.listen(PORT, () => {
   console.log(`\n🚀 Server running on port ${PORT}`);
-  console.log(`   POST /send-otp`);
-  console.log(`   POST /verify-otp`);
-  console.log(`   GET  /api/all-news`);
-  console.log(`   GET  /api/latest-news`);
-  console.log(`   🔥 4 APIs: NewsAPI + GNews + Currents`);
+  console.log(`   🔥 4 APIs: NewsAPI (20) + GNews (15) + Currents (15)`);
   console.log(`   Auto fetch every 6 hours`);
-  console.log(`   Auto delete news older than 5 days\n`);
+  console.log(`   Auto delete news older than 3 days\n`);
 });
