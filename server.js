@@ -1,5 +1,5 @@
 // ════════════════════════════════════════════════════════════
-//  NEWZYY — COMPLETE FIXED BACKEND
+//  NEWZYY — PURE NEWS BACKEND (No Login/Signup/OTP)
 //  4 APIs | 20 news per category | Auto delete 3 days old
 // ════════════════════════════════════════════════════════════
 
@@ -7,7 +7,6 @@ const fetch = require('node-fetch');
 const express = require('express');
 const cors = require('cors');
 const fs = require('fs');
-const { Resend } = require('resend');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -15,33 +14,19 @@ const PORT = process.env.PORT || 3001;
 const ARTICLES_FILE = '/tmp/nzy_articles.json';
 
 // API Keys
-const RESEND_API_KEY = process.env.RESEND_API_KEY || 're_S4GytVCQ_BXV1iiAnkMcMzrWi79PJFR8S';
 const NEWS_API_KEY = process.env.NEWS_API_KEY || '3d1c54f463114aa7b89add3425c96029';
 const GNEWS_API_KEY = process.env.GNEWS_API_KEY || 'd1f847083123284d432ab28b413281c1';
 const CURRENTS_API_KEY = process.env.CURRENTS_API_KEY || 'kRjvwkCfg3uNzr1EYjYLSyTIatY-vq9FxxlBxt2Scb-JSfUu';
 
-const resend = new Resend(RESEND_API_KEY);
-
-// OTP Store
-const otpStore = {};
-const OTP_EXPIRY_MS = 5 * 60 * 1000;
-const MAX_ATTEMPTS = 5;
-const RATE_LIMIT_MS = 60 * 1000;
-
-setInterval(() => {
-  const now = Date.now();
-  for (const email in otpStore) {
-    if (otpStore[email].expiresAt < now) delete otpStore[email];
-  }
-}, 10 * 60 * 1000);
-
 app.use(cors({ origin: '*', methods: ['GET', 'POST', 'OPTIONS'], allowedHeaders: ['Content-Type'] }));
 app.use(express.json());
 
+// Health check
 app.get('/', (req, res) => {
-  res.json({ status: 'ok', service: 'Newzyy 4-API News', time: new Date().toISOString() });
+  res.json({ status: 'ok', service: 'Newzyy Pure News API', time: new Date().toISOString() });
 });
 
+// Get ALL published news
 app.get('/api/all-news', (req, res) => {
   try {
     if (!fs.existsSync(ARTICLES_FILE)) return res.json({ success: true, news: [] });
@@ -55,6 +40,7 @@ app.get('/api/all-news', (req, res) => {
   }
 });
 
+// Get latest news
 app.get('/api/latest-news', (req, res) => {
   try {
     if (!fs.existsSync(ARTICLES_FILE)) return res.json({ success: true, news: [] });
@@ -65,60 +51,6 @@ app.get('/api/latest-news', (req, res) => {
     res.json({ success: true, news: articles });
   } catch(e) {
     res.json({ success: true, news: [] });
-  }
-});
-
-// ========== SEND OTP ==========
-app.post('/send-otp', async (req, res) => {
-  try {
-    const { email, type = 'signup', name = 'User' } = req.body;
-    if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
-      return res.status(400).json({ success: false, message: 'Invalid email address.' });
-    }
-    const existing = otpStore[email.toLowerCase()];
-    if (existing && existing.sentAt && (Date.now() - existing.sentAt) < RATE_LIMIT_MS) {
-      const wait = Math.ceil((RATE_LIMIT_MS - (Date.now() - existing.sentAt)) / 1000);
-      return res.status(429).json({ success: false, message: `Please wait ${wait} seconds.` });
-    }
-    const code = String(Math.floor(100000 + Math.random() * 900000));
-    otpStore[email.toLowerCase()] = { code, expiresAt: Date.now() + OTP_EXPIRY_MS, sentAt: Date.now(), attempts: 0, type };
-    const isSignup = type === 'signup';
-    const subject = isSignup ? `${code} — Your Newzyy Verification Code` : `${code} — Confirm Your Newzyy Sign In`;
-    const htmlBody = `<!DOCTYPE html><html><head><meta charset="UTF-8"></head><body style="font-family:Arial;padding:20px"><div style="max-width:500px;margin:0 auto;background:#fff;border-radius:12px"><div style="background:#0f0f0f;padding:24px;text-align:center"><h1 style="color:#fff">Newzy<span style="color:#e8380d">y</span></h1></div><div style="padding:32px"><h2>Hi ${name},</h2><p>Your verification code is:</p><div style="background:#f7f7f5;padding:20px;text-align:center;font-size:32px;letter-spacing:8px;font-weight:bold">${code}</div><p>Expires in 5 minutes.</p></div></div></body></html>`;
-    const { data, error } = await resend.emails.send({
-      from: `Newzyy <${process.env.FROM_EMAIL || 'onboarding@resend.dev'}>`,
-      to: [email], subject, html: htmlBody
-    });
-    if (error) return res.status(500).json({ success: false, message: 'Failed to send email.' });
-    res.json({ success: true, message: 'Verification code sent!' });
-  } catch (err) {
-    res.status(500).json({ success: false, message: 'Server error.' });
-  }
-});
-
-// ========== VERIFY OTP ==========
-app.post('/verify-otp', (req, res) => {
-  try {
-    const { email, code } = req.body;
-    if (!email || !code) return res.status(400).json({ success: false, message: 'Email and code required.' });
-    const record = otpStore[email.toLowerCase()];
-    if (!record) return res.status(400).json({ success: false, message: 'No code found.' });
-    if (Date.now() > record.expiresAt) {
-      delete otpStore[email.toLowerCase()];
-      return res.status(400).json({ success: false, message: 'Code expired.', expired: true });
-    }
-    if (record.attempts >= MAX_ATTEMPTS) {
-      delete otpStore[email.toLowerCase()];
-      return res.status(429).json({ success: false, message: 'Too many attempts.' });
-    }
-    if (String(code).trim() !== String(record.code)) {
-      record.attempts++;
-      return res.status(400).json({ success: false, message: `Incorrect code. ${MAX_ATTEMPTS - record.attempts} attempts left.` });
-    }
-    delete otpStore[email.toLowerCase()];
-    res.json({ success: true, message: 'Email verified!' });
-  } catch (err) {
-    res.status(500).json({ success: false, message: 'Server error.' });
   }
 });
 
@@ -308,6 +240,18 @@ async function fetchAllNewsMultiAPI() {
   console.log(`✅ 4-API fetch completed at ${new Date().toLocaleTimeString()}\n`);
 }
 
+// ========== MANUAL FETCH TRIGGER ==========
+app.get('/manual-fetch', async (req, res) => {
+  console.log('📡 Manual fetch triggered at ' + new Date().toLocaleTimeString());
+  try {
+    await fetchAllNewsMultiAPI();
+    res.json({ success: true, message: 'Manual fetch completed', time: new Date().toISOString() });
+  } catch(e) {
+    console.error('Manual fetch error:', e);
+    res.json({ success: false, message: e.message });
+  }
+});
+
 // ========== START SCHEDULE ==========
 console.log('📰 Initializing 4-API auto news fetcher...');
 fetchAllNewsMultiAPI().catch(console.error);
@@ -334,6 +278,8 @@ setInterval(async () => {
 app.listen(PORT, () => {
   console.log(`\n🚀 Server running on port ${PORT}`);
   console.log(`   🔥 4 APIs: NewsAPI (20) + GNews (15) + Currents (15)`);
+  console.log(`   GET /api/all-news - Get all news`);
+  console.log(`   GET /manual-fetch - Force manual fetch`);
   console.log(`   Auto fetch every 6 hours`);
   console.log(`   Auto delete news older than 3 days\n`);
 });
