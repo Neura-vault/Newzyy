@@ -13,7 +13,7 @@ const PORT = process.env.PORT || 3001;
 const ARTICLES_FILE = '/tmp/nzy_articles.json';
 
 // ========== API KEY ==========
-const WORLD_NEWS_API_KEY = process.env.WORLD_NEWS_API_KEY || 'YOUR_WORLD_NEWS_API_KEY_HERE';
+const WORLD_NEWS_API_KEY = process.env.WORLD_NEWS_API_KEY || 'e6031437382841f4921da3c6ba6ecd82';
 
 app.use(cors({ origin: '*', methods: ['GET', 'POST', 'OPTIONS'], allowedHeaders: ['Content-Type'] }));
 app.use(express.json());
