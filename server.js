@@ -209,7 +209,7 @@ async function fetchFromGuardian(category) {
 
 // ========== NOTIFY SUBSCRIBERS ==========
 async function notifySubscribers(article) {
-  if (!EMAILJS_SERVICE_ID || EMAILJS_SERVICE_ID === 'YOUR_SERVICE_ID') return;
+  if (!EMAILJS_SERVICE_ID || EMAILJS_SERVICE_ID === 'service_3z6xi72') return;
   
   let subscribers = [];
   try {
@@ -238,9 +238,9 @@ async function notifySubscribers(article) {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          service_id: EMAILJS_SERVICE_ID,
-          template_id: EMAILJS_TEMPLATE_ID,
-          user_id: EMAILJS_PUBLIC_KEY,
+          service_id: service_3z6xi72,
+          template_id: template_evvy4bm,
+          user_id: kJzmH56g3PLzX-X-D,
           template_params: templateParams
         })
       });
