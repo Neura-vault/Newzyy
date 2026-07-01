@@ -18,9 +18,9 @@ const CURRENTS_API_KEY = process.env.CURRENTS_API_KEY || 'kRjvwkCfg3uNzr1EYjYLSy
 const GUARDIAN_API_KEY = process.env.GUARDIAN_API_KEY || 'ab35f734-ceb0-4a49-bb7d-24c0c3331bd6';
 
 // ========== EMAILJS KEYS (NEWSLETTER) ==========
-const EMAILJS_SERVICE_ID = 'YOUR_SERVICE_ID';
-const EMAILJS_TEMPLATE_ID = 'YOUR_TEMPLATE_ID';
-const EMAILJS_PUBLIC_KEY = 'YOUR_PUBLIC_KEY';
+const EMAILJS_SERVICE_ID = 'service_3z6xi72';
+const EMAILJS_TEMPLATE_ID = 'template_evvy4bm';
+const EMAILJS_PUBLIC_KEY = 'kJzmH56g3PLzX-X-D';
 
 app.use(cors({ origin: '*', methods: ['GET', 'POST', 'OPTIONS'], allowedHeaders: ['Content-Type'] }));
 app.use(express.json());
@@ -207,9 +207,12 @@ async function fetchFromGuardian(category) {
   }
 }
 
-// ========== NOTIFY SUBSCRIBERS ==========
+// ========== NOTIFY SUBSCRIBERS (NEWSLETTER) ==========
 async function notifySubscribers(article) {
-  if (!EMAILJS_SERVICE_ID || EMAILJS_SERVICE_ID === 'service_3z6xi72') return;
+  if (!EMAILJS_SERVICE_ID || EMAILJS_SERVICE_ID === 'service_3z6xi72') {
+    console.log('⚠️ EmailJS not configured. Skipping notifications.');
+    return;
+  }
   
   let subscribers = [];
   try {
@@ -219,7 +222,10 @@ async function notifySubscribers(article) {
     }
   } catch(e) { subscribers = []; }
   
-  if (subscribers.length === 0) return;
+  if (subscribers.length === 0) {
+    console.log('📧 No subscribers to notify.');
+    return;
+  }
   
   console.log('📧 Sending notification to ' + subscribers.length + ' subscribers...');
   
@@ -234,20 +240,25 @@ async function notifySubscribers(article) {
         unsubscribe_link: 'https://newzyy.site/?unsubscribe=' + encodeURIComponent(sub.email)
       };
       
-      await fetch('https://api.emailjs.com/api/v1.0/email/send', {
+      const response = await fetch('https://api.emailjs.com/api/v1.0/email/send', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          service_id: service_3z6xi72,
-          template_id: template_evvy4bm,
-          user_id: kJzmH56g3PLzX-X-D,
+          service_id: EMAILJS_SERVICE_ID,
+          template_id: EMAILJS_TEMPLATE_ID,
+          user_id: EMAILJS_PUBLIC_KEY,
           template_params: templateParams
         })
       });
       
-      console.log('✅ Email sent to ' + sub.email);
+      if (response.ok) {
+        console.log('✅ Email sent to ' + sub.email);
+      } else {
+        const errorText = await response.text();
+        console.error('❌ Failed to send to ' + sub.email + ': ' + response.status + ' ' + errorText);
+      }
     } catch(e) {
-      console.error('❌ Failed to send to ' + sub.email + ':', e);
+      console.error('❌ Failed to send to ' + sub.email + ':', e.message);
     }
     await new Promise(r => setTimeout(r, 200));
   }
@@ -320,7 +331,8 @@ async function fetchAllNews() {
     
     if (newCount > 0) {
       console.log('   ✅ ' + cat + ': ' + newCount + ' new articles added');
-      if (firstArticle && totalNew === newCount) {
+      // Send notification for first article only (to avoid spam)
+      if (firstArticle) {
         await notifySubscribers(firstArticle);
       }
     }
