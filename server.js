@@ -1,5 +1,5 @@
 // ════════════════════════════════════════════════════════════
-//  NEWZYY — World News API + Currents + Guardian (Full Article)
+//  NEWZYY — World News API + Currents + Guardian + EmailJS
 // ════════════════════════════════════════════════════════════
 
 const fetch = require('node-fetch');
@@ -16,6 +16,11 @@ const ARTICLES_FILE = '/tmp/nzy_articles.json';
 const WORLD_NEWS_API_KEY = process.env.WORLD_NEWS_API_KEY || 'e6031437382841f4921da3c6ba6ecd82';
 const CURRENTS_API_KEY = process.env.CURRENTS_API_KEY || 'kRjvwkCfg3uNzr1EYjYLSyTIatY-vq9FxxlBxt2Scb-JSfUu';
 const GUARDIAN_API_KEY = process.env.GUARDIAN_API_KEY || 'ab35f734-ceb0-4a49-bb7d-24c0c3331bd6';
+
+// ========== EMAILJS KEYS (NEWSLETTER) ==========
+const EMAILJS_SERVICE_ID = 'service_3z6xi72'; // ← EmailJS se copy karo
+const EMAILJS_TEMPLATE_ID = 'template_q9ape8s'; // ← EmailJS se copy karo
+const EMAILJS_PUBLIC_KEY = 'kJzmH56g3PLzX-X-D'; // ← EmailJS se copy karo
 
 app.use(cors({ origin: '*', methods: ['GET', 'POST', 'OPTIONS'], allowedHeaders: ['Content-Type'] }));
 app.use(express.json());
@@ -64,7 +69,7 @@ function formatTimeAgo(dateString) {
   const diffHours = Math.floor(diffMins / 60);
   if (diffHours < 24) return `${diffHours}h ago`;
   const diffDays = Math.floor(diffHours / 24);
-  return `${diffDays}d ago`;
+  return `${diffDays}d ago';
 }
 
 // ========== API 1: WORLD NEWS API (Full Article) ==========
@@ -202,6 +207,52 @@ async function fetchFromGuardian(category) {
   }
 }
 
+// ========== NOTIFY SUBSCRIBERS (NEWSLETTER) ==========
+async function notifySubscribers(article) {
+  if (!EMAILJS_SERVICE_ID || EMAILJS_SERVICE_ID === 'YOUR_SERVICE_ID') return;
+  
+  let subscribers = [];
+  try {
+    if (fs.existsSync('/tmp/nzy_subscribers.json')) {
+      const data = fs.readFileSync('/tmp/nzy_subscribers.json', 'utf8');
+      subscribers = JSON.parse(data);
+    }
+  } catch(e) { subscribers = []; }
+  
+  if (subscribers.length === 0) return;
+  
+  console.log(`📧 Sending notification to ${subscribers.length} subscribers...`);
+  
+  for (const sub of subscribers) {
+    try {
+      const templateParams = {
+        to_email: sub.email,
+        to_name: sub.name || 'Reader',
+        article_title: article.title,
+        article_excerpt: (article.excerpt || '').substring(0, 100),
+        article_link: `https://newzyy.site/article/${article.id}`,
+        unsubscribe_link: `https://newzyy.site/?unsubscribe=${encodeURIComponent(sub.email)}`
+      };
+      
+      await fetch('https://api.emailjs.com/api/v1.0/email/send', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          service_id: EMAILJS_SERVICE_ID,
+          template_id: EMAILJS_TEMPLATE_ID,
+          user_id: EMAILJS_PUBLIC_KEY,
+          template_params: templateParams
+        })
+      });
+      
+      console.log(`✅ Email sent to ${sub.email}`);
+    } catch(e) {
+      console.error(`❌ Failed to send to ${sub.email}:`, e);
+    }
+    await new Promise(r => setTimeout(r, 200));
+  }
+}
+
 // ========== MAIN FETCH FUNCTION ==========
 async function fetchAllNews() {
   console.log(`\n🔄 [${new Date().toLocaleTimeString()}] Starting 3-API news fetch...`);
@@ -231,6 +282,7 @@ async function fetchAllNews() {
     console.log(`   World: ${world.length}, Currents: ${currents.length}, Guardian: ${guardian.length}, Total: ${allArticles.length}`);
     
     let newCount = 0;
+    let firstArticle = null;
     
     for (const article of allArticles) {
       if (!article.title) continue;
@@ -262,10 +314,16 @@ async function fetchAllNews() {
       existingTitles.add(titleLower);
       newCount++;
       totalNew++;
+      
+      if (!firstArticle) firstArticle = newArticle;
     }
     
     if (newCount > 0) {
       console.log(`   ✅ ${cat}: ${newCount} new articles added`);
+      // Notify subscribers about first new article
+      if (firstArticle && totalNew === newCount) {
+        await notifySubscribers(firstArticle);
+      }
     }
     
     await new Promise(r => setTimeout(r, 300));
