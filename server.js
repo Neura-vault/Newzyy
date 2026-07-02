@@ -1,5 +1,5 @@
 // ════════════════════════════════════════════════════════════
-//  NEWZYY — World News API + Currents + Guardian + EmailJS
+//  NEWZYY — World News API + Currents + Guardian (Full Article)
 // ════════════════════════════════════════════════════════════
 
 const fetch = require('node-fetch');
@@ -16,11 +16,6 @@ const ARTICLES_FILE = '/tmp/nzy_articles.json';
 const WORLD_NEWS_API_KEY = process.env.WORLD_NEWS_API_KEY || 'e6031437382841f4921da3c6ba6ecd82';
 const CURRENTS_API_KEY = process.env.CURRENTS_API_KEY || 'kRjvwkCfg3uNzr1EYjYLSyTIatY-vq9FxxlBxt2Scb-JSfUu';
 const GUARDIAN_API_KEY = process.env.GUARDIAN_API_KEY || 'ab35f734-ceb0-4a49-bb7d-24c0c3331bd6';
-
-// ========== EMAILJS KEYS (NEWSLETTER) ==========
-const EMAILJS_SERVICE_ID = 'service_3z6xi72';
-const EMAILJS_TEMPLATE_ID = 'template_evvy4bm';
-const EMAILJS_PUBLIC_KEY = 'kJzmH56g3PLzX-X-D';
 
 app.use(cors({ origin: '*', methods: ['GET', 'POST', 'OPTIONS'], allowedHeaders: ['Content-Type'] }));
 app.use(express.json());
@@ -65,14 +60,14 @@ function formatTimeAgo(dateString) {
   const now = new Date();
   const diffMins = Math.floor((now - date) / 60000);
   if (diffMins < 1) return 'Just now';
-  if (diffMins < 60) return diffMins + 'm ago';
+  if (diffMins < 60) return `${diffMins}m ago`;
   const diffHours = Math.floor(diffMins / 60);
-  if (diffHours < 24) return diffHours + 'h ago';
+  if (diffHours < 24) return `${diffHours}h ago`;
   const diffDays = Math.floor(diffHours / 24);
-  return diffDays + 'd ago';
+  return `${diffDays}d ago`;
 }
 
-// ========== API 1: WORLD NEWS API ==========
+// ========== API 1: WORLD NEWS API (Full Article) ==========
 async function fetchFromWorldNews(category) {
   if (!WORLD_NEWS_API_KEY) return [];
   
@@ -87,7 +82,7 @@ async function fetchFromWorldNews(category) {
   };
   const cat = worldCatMap[category] || category;
   
-  const url = 'https://api.worldnewsapi.com/search-news?text=' + cat + '&language=en&sort=publish-time&number=15&api-key=' + WORLD_NEWS_API_KEY;
+  const url = `https://api.worldnewsapi.com/search-news?text=${cat}&language=en&sort=publish-time&number=15&api-key=${WORLD_NEWS_API_KEY}`;
   
   try {
     const response = await fetch(url);
@@ -97,7 +92,7 @@ async function fetchFromWorldNews(category) {
     const fullArticles = [];
     for (const article of data.news) {
       try {
-        const extractUrl = 'https://api.worldnewsapi.com/extract-news?url=' + encodeURIComponent(article.url) + '&api-key=' + WORLD_NEWS_API_KEY;
+        const extractUrl = `https://api.worldnewsapi.com/extract-news?url=${encodeURIComponent(article.url)}&api-key=${WORLD_NEWS_API_KEY}`;
         const extractRes = await fetch(extractUrl);
         const extractData = await extractRes.json();
         
@@ -146,7 +141,7 @@ async function fetchFromCurrents(category) {
     entertainment: 'entertainment' 
   };
   const cat = categoryMap[category] || category;
-  const url = 'https://api.currentsapi.services/v1/latest-news?category=' + cat + '&language=en&apiKey=' + CURRENTS_API_KEY + '&page_size=15';
+  const url = `https://api.currentsapi.services/v1/latest-news?category=${cat}&language=en&apiKey=${CURRENTS_API_KEY}&page_size=15`;
   
   try {
     const response = await fetch(url);
@@ -184,7 +179,7 @@ async function fetchFromGuardian(category) {
   };
   
   const cat = guardianCategories[category] || category;
-  const url = 'https://content.guardianapis.com/search?section=' + cat + '&api-key=' + GUARDIAN_API_KEY + '&show-fields=body,thumbnail,trailText&page-size=15&order-by=newest';
+  const url = `https://content.guardianapis.com/search?section=${cat}&api-key=${GUARDIAN_API_KEY}&show-fields=body,thumbnail,trailText&page-size=15&order-by=newest`;
   
   try {
     const response = await fetch(url);
@@ -207,73 +202,16 @@ async function fetchFromGuardian(category) {
   }
 }
 
-// ========== NOTIFY SUBSCRIBERS (NEWSLETTER) ==========
-async function notifySubscribers(article) {
-  if (!EMAILJS_SERVICE_ID || EMAILJS_SERVICE_ID === 'service_3z6xi72') {
-    console.log('⚠️ EmailJS not configured. Skipping notifications.');
-    return;
-  }
-  
-  let subscribers = [];
-  try {
-    if (fs.existsSync('/tmp/nzy_subscribers.json')) {
-      const data = fs.readFileSync('/tmp/nzy_subscribers.json', 'utf8');
-      subscribers = JSON.parse(data);
-    }
-  } catch(e) { subscribers = []; }
-  
-  if (subscribers.length === 0) {
-    console.log('📧 No subscribers to notify.');
-    return;
-  }
-  
-  console.log('📧 Sending notification to ' + subscribers.length + ' subscribers...');
-  
-  for (const sub of subscribers) {
-    try {
-      const templateParams = {
-        to_email: sub.email,
-        to_name: sub.name || 'Reader',
-        article_title: article.title,
-        article_excerpt: (article.excerpt || '').substring(0, 100),
-        article_link: 'https://newzyy.site/article/' + article.id,
-        unsubscribe_link: 'https://newzyy.site/?unsubscribe=' + encodeURIComponent(sub.email)
-      };
-      
-      const response = await fetch('https://api.emailjs.com/api/v1.0/email/send', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          service_id: EMAILJS_SERVICE_ID,
-          template_id: EMAILJS_TEMPLATE_ID,
-          user_id: EMAILJS_PUBLIC_KEY,
-          template_params: templateParams
-        })
-      });
-      
-      if (response.ok) {
-        console.log('✅ Email sent to ' + sub.email);
-      } else {
-        const errorText = await response.text();
-        console.error('❌ Failed to send to ' + sub.email + ': ' + response.status + ' ' + errorText);
-      }
-    } catch(e) {
-      console.error('❌ Failed to send to ' + sub.email + ':', e.message);
-    }
-    await new Promise(r => setTimeout(r, 200));
-  }
-}
-
 // ========== MAIN FETCH FUNCTION ==========
 async function fetchAllNews() {
-  console.log('\n🔄 [' + new Date().toLocaleTimeString() + '] Starting 3-API news fetch...');
+  console.log(`\n🔄 [${new Date().toLocaleTimeString()}] Starting 3-API news fetch...`);
   
   let existing = [];
   try {
     if (fs.existsSync(ARTICLES_FILE)) {
       const data = fs.readFileSync(ARTICLES_FILE, 'utf8');
       existing = JSON.parse(data);
-      console.log('📚 Loaded ' + existing.length + ' existing articles');
+      console.log(`📚 Loaded ${existing.length} existing articles`);
     }
   } catch(e) { existing = []; }
 
@@ -281,7 +219,7 @@ async function fetchAllNews() {
   const existingTitles = new Set(existing.map(a => a.title?.toLowerCase()));
 
   for (const cat of CATEGORIES) {
-    console.log('\n📰 Fetching ' + cat + '...');
+    console.log(`\n📰 Fetching ${cat}...`);
     
     const [world, currents, guardian] = await Promise.all([
       fetchFromWorldNews(cat),
@@ -290,10 +228,9 @@ async function fetchAllNews() {
     ]);
     
     const allArticles = [...world, ...currents, ...guardian];
-    console.log('   World: ' + world.length + ', Currents: ' + currents.length + ', Guardian: ' + guardian.length + ', Total: ' + allArticles.length);
+    console.log(`   World: ${world.length}, Currents: ${currents.length}, Guardian: ${guardian.length}, Total: ${allArticles.length}`);
     
     let newCount = 0;
-    let firstArticle = null;
     
     for (const article of allArticles) {
       if (!article.title) continue;
@@ -302,7 +239,7 @@ async function fetchAllNews() {
       if (existingTitles.has(titleLower)) continue;
       
       const newArticle = {
-        id: 'auto_' + Date.now() + '_' + Math.random().toString(36).substring(2, 10),
+        id: `auto_${Date.now()}_${Math.random().toString(36).substring(2, 10)}`,
         category: cat,
         featured: cat === 'politics' && newCount === 0,
         trending: false,
@@ -325,16 +262,10 @@ async function fetchAllNews() {
       existingTitles.add(titleLower);
       newCount++;
       totalNew++;
-      
-      if (!firstArticle) firstArticle = newArticle;
     }
     
     if (newCount > 0) {
-      console.log('   ✅ ' + cat + ': ' + newCount + ' new articles added');
-      // Send notification for first article only (to avoid spam)
-      if (firstArticle) {
-        await notifySubscribers(firstArticle);
-      }
+      console.log(`   ✅ ${cat}: ${newCount} new articles added`);
     }
     
     await new Promise(r => setTimeout(r, 300));
@@ -345,14 +276,14 @@ async function fetchAllNews() {
   const beforeDelete = existing.length;
   existing = existing.filter(a => new Date(a.fetched_at || a.id) > threeDaysAgo);
   const deletedCount = beforeDelete - existing.length;
-  if (deletedCount > 0) console.log('🗑️ Auto-deleted ' + deletedCount + ' old news (older than 3 days)');
+  if (deletedCount > 0) console.log(`🗑️ Auto-deleted ${deletedCount} old news (older than 3 days)`);
   
   existing.sort((a, b) => new Date(b.fetched_at || b.id) - new Date(a.fetched_at || a.id));
   
   fs.writeFileSync(ARTICLES_FILE, JSON.stringify(existing));
   
-  console.log('\n📊 SUMMARY: +' + totalNew + ' new | Total: ' + existing.length + ' articles');
-  console.log('✅ Fetch completed at ' + new Date().toLocaleTimeString() + '\n');
+  console.log(`\n📊 SUMMARY: +${totalNew} new | Total: ${existing.length} articles`);
+  console.log(`✅ Fetch completed at ${new Date().toLocaleTimeString()}\n`);
 }
 
 // ========== MANUAL FETCH ==========
@@ -378,10 +309,10 @@ setInterval(async () => {
 
 // ========== START SERVER ==========
 app.listen(PORT, () => {
-  console.log('\n🚀 Server running on port ' + PORT);
-  console.log('   🔥 World News API + Currents + Guardian (Full Article Text!)');
-  console.log('   GET /api/all-news');
-  console.log('   GET /manual-fetch');
-  console.log('   Auto fetch every 6 hours');
-  console.log('   Auto delete news older than 3 days\n');
+  console.log(`\n🚀 Server running on port ${PORT}`);
+  console.log(`   🔥 World News API + Currents + Guardian (Full Article Text!)`);
+  console.log(`   GET /api/all-news`);
+  console.log(`   GET /manual-fetch`);
+  console.log(`   Auto fetch every 6 hours`);
+  console.log(`   Auto delete news older than 3 days\n`);
 });
