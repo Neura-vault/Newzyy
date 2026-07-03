@@ -13,6 +13,7 @@ const PORT = process.env.PORT || 3001;
 const ARTICLES_FILE = '/tmp/nzy_articles.json';
 
 // ========== API KEYS ==========
+const WORLD_NEWS_API_KEY = process.env.WORLD_NEWS_API_KEY || 'e6031437382841f4921da3c6ba6ecd82';
 const CURRENTS_API_KEY = process.env.CURRENTS_API_KEY || 'kRjvwkCfg3uNzr1EYjYLSyTIatY-vq9FxxlBxt2Scb-JSfUu';
 const GUARDIAN_API_KEY = process.env.GUARDIAN_API_KEY || 'ab35f734-ceb0-4a49-bb7d-24c0c3331bd6';
 
@@ -66,7 +67,67 @@ function formatTimeAgo(dateString) {
   return `${diffDays}d ago`;
 }
 
-// ========== API 1: CURRENTS API ==========
+// ========== API 1: WORLD NEWS API (Full Article) ==========
+async function fetchFromWorldNews(category) {
+  if (!WORLD_NEWS_API_KEY) return [];
+  
+  const worldCatMap = {
+    technology: 'tech',
+    sports: 'sports',
+    business: 'business',
+    health: 'health',
+    politics: 'politics',
+    science: 'science',
+    entertainment: 'entertainment'
+  };
+  const cat = worldCatMap[category] || category;
+  
+  const url = `https://api.worldnewsapi.com/search-news?text=${cat}&language=en&sort=publish-time&number=15&api-key=${WORLD_NEWS_API_KEY}`;
+  
+  try {
+    const response = await fetch(url);
+    const data = await response.json();
+    if (!data.news || data.news.length === 0) return [];
+    
+    const fullArticles = [];
+    for (const article of data.news) {
+      try {
+        const extractUrl = `https://api.worldnewsapi.com/extract-news?url=${encodeURIComponent(article.url)}&api-key=${WORLD_NEWS_API_KEY}`;
+        const extractRes = await fetch(extractUrl);
+        const extractData = await extractRes.json();
+        
+        fullArticles.push({
+          title: article.title || extractData.title,
+          description: article.text || extractData.text || '',
+          body: extractData.text || article.text || '',
+          url: article.url || extractData.url,
+          image: article.image || extractData.image,
+          author: article.author || extractData.author || 'World News',
+          publishedAt: article.publish_date || new Date().toISOString(),
+          source: 'World News'
+        });
+      } catch(e) {
+        fullArticles.push({
+          title: article.title,
+          description: article.text || '',
+          body: article.text || '',
+          url: article.url,
+          image: article.image,
+          author: article.author || 'World News',
+          publishedAt: article.publish_date || new Date().toISOString(),
+          source: 'World News'
+        });
+      }
+      await new Promise(r => setTimeout(r, 200));
+    }
+    return fullArticles;
+  } catch(e) {
+    console.error('World News API error:', e.message);
+    return [];
+  }
+}
+
+// ========== API 2: CURRENTS API ==========
 async function fetchFromCurrents(category) {
   if (!CURRENTS_API_KEY) return [];
   
@@ -103,7 +164,7 @@ async function fetchFromCurrents(category) {
   }
 }
 
-// ========== API 2: GUARDIAN API ==========
+// ========== API 3: GUARDIAN API ==========
 async function fetchFromGuardian(category) {
   if (!GUARDIAN_API_KEY) return [];
   
@@ -210,6 +271,7 @@ async function fetchAllNews() {
     await new Promise(r => setTimeout(r, 300));
   }
   
+  // Auto-delete old news (3 days)
   const threeDaysAgo = new Date();
   threeDaysAgo.setDate(threeDaysAgo.getDate() - 3);
   const beforeDelete = existing.length;
