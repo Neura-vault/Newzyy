@@ -40,7 +40,8 @@ app.get('/api/all-news', (req, res) => {
 });
 
 // ========== CATEGORIES ==========
-const CATEGORIES = ['technology', 'sports', 'business', 'health', 'politics', 'science', 'entertainment'];
+const CATEGORIES = [
+    'politics', 'technology', 'sports', 'business', 'health','science', 'entertainment', 'travel', 'environment', 'culture', 'world', 'economy'];
 
 function getCategoryImage(cat) {
   const images = {
