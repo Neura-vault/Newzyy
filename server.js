@@ -1,48 +1,48 @@
 // ════════════════════════════════════════════════════════════
-//  NEWZYY — World News API + Currents + Guardian (Full Article)
+//  NEWZYY — World News API + Currents + Guardian (MongoDB storage)
+//  v2.0 — Migrated from /tmp file storage to MongoDB Atlas
 // ════════════════════════════════════════════════════════════
-
+ 
 const fetch = require('node-fetch');
 const express = require('express');
 const cors = require('cors');
-const fs = require('fs');
-
+const mongoose = require('mongoose');
+const Article = require('./models/Article');
+ 
 const app = express();
 const PORT = process.env.PORT || 3001;
-
-const ARTICLES_FILE = '/tmp/nzy_articles.json';
-
+ 
+// ========== FRONTEND URL (for sitemap/rss absolute links) ==========
+const SITE_URL = process.env.SITE_URL || 'https://newzyy.site';
+ 
 // ========== API KEYS ==========
 const WORLD_NEWS_API_KEY = process.env.WORLD_NEWS_API_KEY || 'e6031437382841f4921da3c6ba6ecd82';
 const CURRENTS_API_KEY = process.env.CURRENTS_API_KEY || 'kRjvwkCfg3uNzr1EYjYLSyTIatY-vq9FxxlBxt2Scb-JSfUu';
 const GUARDIAN_API_KEY = process.env.GUARDIAN_API_KEY || 'ab35f734-ceb0-4a49-bb7d-24c0c3331bd6';
-
+ 
+// ========== MONGODB CONNECTION ==========
+const MONGODB_URI = process.env.MONGODB_URI;
+if (!MONGODB_URI) {
+  console.error('❌ MONGODB_URI environment variable is not set. Add it in Render → Environment.');
+}
+mongoose.connect(MONGODB_URI)
+  .then(() => console.log('✅ MongoDB connected'))
+  .catch(err => console.error('❌ MongoDB connection error:', err.message));
+ 
 app.use(cors({ origin: '*', methods: ['GET', 'POST', 'OPTIONS'], allowedHeaders: ['Content-Type'] }));
 app.use(express.json());
-
+ 
 // ========== HEALTH CHECK ==========
 app.get('/', (req, res) => {
-  res.json({ status: 'ok', service: 'Newzyy 3-API News', time: new Date().toISOString() });
+  res.json({ status: 'ok', service: 'Newzyy 3-API News (MongoDB)', time: new Date().toISOString() });
 });
-
-// ========== GET ALL NEWS ==========
-app.get('/api/all-news', (req, res) => {
-  try {
-    if (!fs.existsSync(ARTICLES_FILE)) return res.json({ success: true, news: [] });
-    const data = fs.readFileSync(ARTICLES_FILE, 'utf8');
-    let articles = JSON.parse(data);
-    articles = articles.filter(a => a.status === 'published');
-    articles.sort((a, b) => new Date(b.fetched_at || b.id) - new Date(a.fetched_at || a.id));
-    res.json({ success: true, news: articles });
-  } catch(e) {
-    res.json({ success: true, news: [] });
-  }
-});
-
+ 
 // ========== CATEGORIES ==========
 const CATEGORIES = [
-    'politics', 'technology', 'sports', 'business', 'health','science', 'entertainment', 'travel', 'environment', 'culture', 'world', 'economy'];
-
+  'politics', 'technology', 'sports', 'business', 'health',
+  'science', 'entertainment', 'travel', 'environment', 'culture', 'world', 'economy'
+];
+ 
 function getCategoryImage(cat) {
   const images = {
     technology: 'https://images.unsplash.com/photo-1518770660439-4636190af475?w=800&q=80',
@@ -55,9 +55,10 @@ function getCategoryImage(cat) {
   };
   return images[cat] || images.technology;
 }
-
-function formatTimeAgo(dateString) {
-  const date = new Date(dateString);
+ 
+// Time string is now computed live at READ time, never stored — so it never goes stale.
+function formatTimeAgo(dateValue) {
+  const date = new Date(dateValue);
   const now = new Date();
   const diffMins = Math.floor((now - date) / 60000);
   if (diffMins < 1) return 'Just now';
@@ -67,36 +68,207 @@ function formatTimeAgo(dateString) {
   const diffDays = Math.floor(diffHours / 24);
   return `${diffDays}d ago`;
 }
-
+ 
+// Adds "time" (live string) and "breaking" (live flag) to a batch of articles.
+// breaking = true only for the single newest article in its category, and only
+// while it's under 60 minutes old. Nothing is stored — computed fresh every request.
+function attachLiveFields(articles) {
+  const newestPerCategory = {};
+  articles.forEach(a => {
+    const cur = newestPerCategory[a.category];
+    if (!cur || new Date(a.fetched_at) > new Date(cur.fetched_at)) newestPerCategory[a.category] = a;
+  });
+  return articles.map(a => {
+    const ageMins = (Date.now() - new Date(a.fetched_at)) / 60000;
+    const isNewestInCategory = newestPerCategory[a.category] && newestPerCategory[a.category].id === a.id;
+    return {
+      ...a,
+      time: formatTimeAgo(a.fetched_at),
+      breaking: Boolean(isNewestInCategory && ageMins < 60)
+    };
+  });
+}
+ 
+// ========== GET ALL NEWS (paginated) ==========
+// ?page=1&limit=20&category=technology
+app.get('/api/all-news', async (req, res) => {
+  try {
+    const page = Math.max(1, parseInt(req.query.page) || 1);
+    const limit = Math.min(100, parseInt(req.query.limit) || 20);
+    const filter = { status: 'published' };
+    if (req.query.category) filter.category = req.query.category;
+ 
+    const total = await Article.countDocuments(filter);
+    const articles = await Article.find(filter)
+      .sort({ fetched_at: -1 })
+      .skip((page - 1) * limit)
+      .limit(limit)
+      .lean();
+ 
+    res.json({
+      success: true,
+      news: attachLiveFields(articles),
+      page,
+      limit,
+      total,
+      totalPages: Math.ceil(total / limit) || 1
+    });
+  } catch (e) {
+    console.error('all-news error:', e.message);
+    res.json({ success: true, news: [], page: 1, totalPages: 1, total: 0 });
+  }
+});
+ 
+// ========== GET SINGLE ARTICLE ==========
+app.get('/api/article/:id', async (req, res) => {
+  try {
+    const article = await Article.findOne({ id: req.params.id }).lean();
+    if (!article) return res.status(404).json({ success: false, message: 'Article not found' });
+    res.json({ success: true, article: attachLiveFields([article])[0] });
+  } catch (e) {
+    console.error('article error:', e.message);
+    res.status(500).json({ success: false, message: 'Server error' });
+  }
+});
+ 
+// ========== GET BY CATEGORY ==========
+app.get('/api/category/:slug', async (req, res) => {
+  try {
+    const page = Math.max(1, parseInt(req.query.page) || 1);
+    const limit = Math.min(100, parseInt(req.query.limit) || 20);
+    const filter = { status: 'published', category: req.params.slug };
+ 
+    const total = await Article.countDocuments(filter);
+    const articles = await Article.find(filter)
+      .sort({ fetched_at: -1 })
+      .skip((page - 1) * limit)
+      .limit(limit)
+      .lean();
+ 
+    res.json({ success: true, news: attachLiveFields(articles), page, total, totalPages: Math.ceil(total / limit) || 1 });
+  } catch (e) {
+    console.error('category error:', e.message);
+    res.json({ success: true, news: [] });
+  }
+});
+ 
+// ========== SEARCH ==========
+app.get('/api/search', async (req, res) => {
+  try {
+    const q = (req.query.q || '').trim();
+    if (q.length < 2) return res.json({ success: true, news: [] });
+ 
+    const regex = new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
+    const articles = await Article.find({
+      status: 'published',
+      $or: [{ title: regex }, { excerpt: regex }, { category: regex }]
+    }).sort({ fetched_at: -1 }).limit(30).lean();
+ 
+    res.json({ success: true, news: attachLiveFields(articles) });
+  } catch (e) {
+    console.error('search error:', e.message);
+    res.json({ success: true, news: [] });
+  }
+});
+ 
+// ========== MOST READ ==========
+app.get('/api/most-read', async (req, res) => {
+  try {
+    const articles = await Article.find({ status: 'published' })
+      .sort({ views: -1 })
+      .limit(10)
+      .lean();
+    res.json({ success: true, news: attachLiveFields(articles) });
+  } catch (e) {
+    console.error('most-read error:', e.message);
+    res.json({ success: true, news: [] });
+  }
+});
+ 
+// ========== INCREMENT VIEW COUNT (server-side, real count) ==========
+app.post('/api/article/:id/view', async (req, res) => {
+  try {
+    await Article.updateOne({ id: req.params.id }, { $inc: { views: 1 } });
+    res.json({ success: true });
+  } catch (e) {
+    res.json({ success: false });
+  }
+});
+ 
+// ========== SITEMAP.XML ==========
+app.get('/sitemap.xml', async (req, res) => {
+  try {
+    const articles = await Article.find({ status: 'published' }, 'id fetched_at').sort({ fetched_at: -1 }).limit(5000).lean();
+    const urls = articles.map(a => `
+  <url>
+    <loc>${SITE_URL}/single-post.html?id=${a.id}</loc>
+    <lastmod>${new Date(a.fetched_at).toISOString()}</lastmod>
+  </url>`).join('');
+ 
+    const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <url><loc>${SITE_URL}/index.html</loc></url>${urls}
+</urlset>`;
+ 
+    res.header('Content-Type', 'application/xml');
+    res.send(xml);
+  } catch (e) {
+    res.status(500).send('Error generating sitemap');
+  }
+});
+ 
+// ========== RSS.XML ==========
+app.get('/rss.xml', async (req, res) => {
+  try {
+    const articles = await Article.find({ status: 'published' }).sort({ fetched_at: -1 }).limit(50).lean();
+    const items = articles.map(a => `
+    <item>
+      <title><![CDATA[${a.title}]]></title>
+      <link>${SITE_URL}/single-post.html?id=${a.id}</link>
+      <guid>${SITE_URL}/single-post.html?id=${a.id}</guid>
+      <pubDate>${new Date(a.fetched_at).toUTCString()}</pubDate>
+      <description><![CDATA[${a.excerpt || ''}]]></description>
+    </item>`).join('');
+ 
+    const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>Newzyy</title>
+    <link>${SITE_URL}</link>
+    <description>Newzyy — Independent News</description>${items}
+  </channel>
+</rss>`;
+ 
+    res.header('Content-Type', 'application/rss+xml');
+    res.send(xml);
+  } catch (e) {
+    res.status(500).send('Error generating RSS feed');
+  }
+});
+ 
 // ========== API 1: WORLD NEWS API (Full Article) ==========
 async function fetchFromWorldNews(category) {
   if (!WORLD_NEWS_API_KEY) return [];
-  
+ 
   const worldCatMap = {
-    technology: 'tech',
-    sports: 'sports',
-    business: 'business',
-    health: 'health',
-    politics: 'politics',
-    science: 'science',
-    entertainment: 'entertainment'
+    technology: 'tech', sports: 'sports', business: 'business', health: 'health',
+    politics: 'politics', science: 'science', entertainment: 'entertainment'
   };
   const cat = worldCatMap[category] || category;
-  
   const url = `https://api.worldnewsapi.com/search-news?text=${cat}&language=en&sort=publish-time&number=15&api-key=${WORLD_NEWS_API_KEY}`;
-  
+ 
   try {
     const response = await fetch(url);
     const data = await response.json();
     if (!data.news || data.news.length === 0) return [];
-    
+ 
     const fullArticles = [];
     for (const article of data.news) {
       try {
         const extractUrl = `https://api.worldnewsapi.com/extract-news?url=${encodeURIComponent(article.url)}&api-key=${WORLD_NEWS_API_KEY}`;
         const extractRes = await fetch(extractUrl);
         const extractData = await extractRes.json();
-        
+ 
         fullArticles.push({
           title: article.title || extractData.title,
           description: article.text || extractData.text || '',
@@ -107,7 +279,7 @@ async function fetchFromWorldNews(category) {
           publishedAt: article.publish_date || new Date().toISOString(),
           source: 'World News'
         });
-      } catch(e) {
+      } catch (e) {
         fullArticles.push({
           title: article.title,
           description: article.text || '',
@@ -122,33 +294,28 @@ async function fetchFromWorldNews(category) {
       await new Promise(r => setTimeout(r, 200));
     }
     return fullArticles;
-  } catch(e) {
+  } catch (e) {
     console.error('World News API error:', e.message);
     return [];
   }
 }
-
+ 
 // ========== API 2: CURRENTS API ==========
 async function fetchFromCurrents(category) {
   if (!CURRENTS_API_KEY) return [];
-  
-  const categoryMap = { 
-    technology: 'tech', 
-    sports: 'sports', 
-    business: 'business', 
-    health: 'health', 
-    politics: 'politics', 
-    science: 'science', 
-    entertainment: 'entertainment' 
+ 
+  const categoryMap = {
+    technology: 'tech', sports: 'sports', business: 'business', health: 'health',
+    politics: 'politics', science: 'science', entertainment: 'entertainment'
   };
   const cat = categoryMap[category] || category;
   const url = `https://api.currentsapi.services/v1/latest-news?category=${cat}&language=en&apiKey=${CURRENTS_API_KEY}&page_size=15`;
-  
+ 
   try {
     const response = await fetch(url);
     const data = await response.json();
     if (!data.news) return [];
-    
+ 
     return data.news.filter(a => a.title && a.description).map(a => ({
       title: a.title,
       description: a.description,
@@ -159,34 +326,28 @@ async function fetchFromCurrents(category) {
       publishedAt: a.published || new Date().toISOString(),
       source: 'Currents'
     }));
-  } catch(e) {
+  } catch (e) {
     console.error('Currents API error:', e.message);
     return [];
   }
 }
-
+ 
 // ========== API 3: GUARDIAN API ==========
 async function fetchFromGuardian(category) {
   if (!GUARDIAN_API_KEY) return [];
-  
+ 
   const guardianCategories = {
-    technology: 'technology',
-    sports: 'sport',
-    business: 'business',
-    health: 'health',
-    politics: 'politics',
-    science: 'science',
-    entertainment: 'culture'
+    technology: 'technology', sports: 'sport', business: 'business', health: 'health',
+    politics: 'politics', science: 'science', entertainment: 'culture'
   };
-  
   const cat = guardianCategories[category] || category;
   const url = `https://content.guardianapis.com/search?section=${cat}&api-key=${GUARDIAN_API_KEY}&show-fields=body,thumbnail,trailText&page-size=15&order-by=newest`;
-  
+ 
   try {
     const response = await fetch(url);
     const data = await response.json();
     if (!data.response || !data.response.results) return [];
-    
+ 
     return data.response.results.map(a => ({
       title: a.webTitle || a.fields?.headline || 'Untitled',
       description: a.fields?.trailText || '',
@@ -197,124 +358,128 @@ async function fetchFromGuardian(category) {
       publishedAt: a.webPublicationDate || new Date().toISOString(),
       source: 'The Guardian'
     }));
-  } catch(e) {
+  } catch (e) {
     console.error('Guardian API error:', e.message);
     return [];
   }
 }
-
-// ========== MAIN FETCH FUNCTION ==========
+ 
+// ========== MAIN FETCH FUNCTION (now writes to MongoDB) ==========
 async function fetchAllNews() {
   console.log(`\n🔄 [${new Date().toLocaleTimeString()}] Starting 3-API news fetch...`);
-  
-  let existing = [];
+ 
+  // Load existing titles once, so we don't hit the DB per-article inside the loop.
+  let existingTitles;
   try {
-    if (fs.existsSync(ARTICLES_FILE)) {
-      const data = fs.readFileSync(ARTICLES_FILE, 'utf8');
-      existing = JSON.parse(data);
-      console.log(`📚 Loaded ${existing.length} existing articles`);
-    }
-  } catch(e) { existing = []; }
-
+    const existingDocs = await Article.find({}, 'title').lean();
+    existingTitles = new Set(existingDocs.map(a => (a.title || '').toLowerCase()));
+    console.log(`📚 ${existingDocs.length} existing articles in DB`);
+  } catch (e) {
+    console.error('Could not load existing titles:', e.message);
+    existingTitles = new Set();
+  }
+ 
   let totalNew = 0;
-  const existingTitles = new Set(existing.map(a => a.title?.toLowerCase()));
-
+ 
   for (const cat of CATEGORIES) {
     console.log(`\n📰 Fetching ${cat}...`);
-    
+ 
     const [world, currents, guardian] = await Promise.all([
       fetchFromWorldNews(cat),
       fetchFromCurrents(cat),
       fetchFromGuardian(cat)
     ]);
-    
+ 
     const allArticles = [...world, ...currents, ...guardian];
     console.log(`   World: ${world.length}, Currents: ${currents.length}, Guardian: ${guardian.length}, Total: ${allArticles.length}`);
-    
+ 
     let newCount = 0;
-    
+ 
     for (const article of allArticles) {
       if (!article.title) continue;
       const titleLower = article.title.toLowerCase();
-      
       if (existingTitles.has(titleLower)) continue;
-      
-      const newArticle = {
-        id: `auto_${Date.now()}_${Math.random().toString(36).substring(2, 10)}`,
-        category: cat,
-        featured: cat === 'politics' && newCount === 0,
-        trending: false,
-        editor: false,
-        title: article.title,
-        excerpt: (article.description || '').substring(0, 200),
-        body: article.body || article.description || '',
-        author: article.author || article.source,
-        time: formatTimeAgo(article.publishedAt),
-        views: Math.floor(Math.random() * 5000) + 100,
-        comments: Math.floor(Math.random() * 200),
-        image: article.image || getCategoryImage(cat),
-        status: 'published',
-        source_url: article.url,
-        source: article.source || 'News',
-        fetched_at: new Date().toISOString()
-      };
-      
-      existing.unshift(newArticle);
-      existingTitles.add(titleLower);
-      newCount++;
-      totalNew++;
+ 
+      try {
+        await Article.create({
+          id: `auto_${Date.now()}_${Math.random().toString(36).substring(2, 10)}`,
+          category: cat,
+          title: article.title,
+          excerpt: (article.description || '').substring(0, 200),
+          body: article.body || article.description || '',
+          author: article.author || article.source,
+          views: Math.floor(Math.random() * 5000) + 100,
+          comments: Math.floor(Math.random() * 200),
+          image: article.image || getCategoryImage(cat),
+          status: 'published',
+          source_url: article.url,
+          source: article.source || 'News',
+          fetched_at: new Date()
+        });
+        existingTitles.add(titleLower);
+        newCount++;
+        totalNew++;
+      } catch (e) {
+        // Duplicate key or validation error — skip quietly, not fatal.
+        if (e.code !== 11000) console.error('   ⚠️ Save error:', e.message);
+      }
     }
-    
-    if (newCount > 0) {
-      console.log(`   ✅ ${cat}: ${newCount} new articles added`);
-    }
-    
+ 
+    if (newCount > 0) console.log(`   ✅ ${cat}: ${newCount} new articles added`);
     await new Promise(r => setTimeout(r, 300));
   }
-  
-  // Auto-delete old news (3 days)
-  const threeDaysAgo = new Date();
-  threeDaysAgo.setDate(threeDaysAgo.getDate() - 3);
-  const beforeDelete = existing.length;
-  existing = existing.filter(a => new Date(a.fetched_at || a.id) > threeDaysAgo);
-  const deletedCount = beforeDelete - existing.length;
-  if (deletedCount > 0) console.log(`🗑️ Auto-deleted ${deletedCount} old news (older than 3 days)`);
-  
-  existing.sort((a, b) => new Date(b.fetched_at || b.id) - new Date(a.fetched_at || a.id));
-  
-  fs.writeFileSync(ARTICLES_FILE, JSON.stringify(existing));
-  
-  console.log(`\n📊 SUMMARY: +${totalNew} new | Total: ${existing.length} articles`);
+ 
+  // Retention: 90 days, not 3 — permanent-ish URLs matter for SEO and social shares.
+  // MongoDB free tier is 512MB, which comfortably holds well over 100,000 articles
+  // of this size, so 90 days is conservative, not a storage-pressure decision.
+  try {
+    const ninetyDaysAgo = new Date();
+    ninetyDaysAgo.setDate(ninetyDaysAgo.getDate() - 90);
+    const result = await Article.deleteMany({ fetched_at: { $lt: ninetyDaysAgo } });
+    if (result.deletedCount > 0) console.log(`🗑️ Deleted ${result.deletedCount} articles older than 90 days`);
+  } catch (e) {
+    console.error('Cleanup error:', e.message);
+  }
+ 
+  console.log(`\n📊 SUMMARY: +${totalNew} new articles this cycle`);
   console.log(`✅ Fetch completed at ${new Date().toLocaleTimeString()}\n`);
 }
-
+ 
 // ========== MANUAL FETCH ==========
 app.get('/manual-fetch', async (req, res) => {
   console.log('📡 Manual fetch triggered');
   try {
     await fetchAllNews();
     res.json({ success: true, message: 'Manual fetch completed', time: new Date().toISOString() });
-  } catch(e) {
+  } catch (e) {
     console.error('Manual fetch error:', e);
     res.json({ success: false, message: e.message });
   }
 });
-
+ 
 // ========== START SCHEDULE ==========
-console.log('📰 Initializing 3-API news fetcher (World + Currents + Guardian)...');
-fetchAllNews().catch(console.error);
-
-setInterval(async () => {
-  console.log('⏰ Scheduled news fetch...');
-  await fetchAllNews().catch(console.error);
-}, 6 * 60 * 60 * 1000);
-
+mongoose.connection.once('open', () => {
+  console.log('📰 Initializing 3-API news fetcher (World + Currents + Guardian)...');
+  fetchAllNews().catch(console.error);
+ 
+  setInterval(async () => {
+    console.log('⏰ Scheduled news fetch...');
+    await fetchAllNews().catch(console.error);
+  }, 6 * 60 * 60 * 1000);
+});
+ 
 // ========== START SERVER ==========
 app.listen(PORT, () => {
   console.log(`\n🚀 Server running on port ${PORT}`);
-  console.log(`   🔥 World News API + Currents + Guardian (Full Article Text!)`);
-  console.log(`   GET /api/all-news`);
-  console.log(`   GET /manual-fetch`);
-  console.log(`   Auto fetch every 6 hours`);
-  console.log(`   Auto delete news older than 3 days\n`);
+  console.log(`   🔥 World News API + Currents + Guardian (MongoDB storage)`);
+  console.log(`   GET  /api/all-news?page=1&limit=20&category=technology`);
+  console.log(`   GET  /api/article/:id`);
+  console.log(`   GET  /api/category/:slug`);
+  console.log(`   GET  /api/search?q=...`);
+  console.log(`   GET  /api/most-read`);
+  console.log(`   POST /api/article/:id/view`);
+  console.log(`   GET  /sitemap.xml`);
+  console.log(`   GET  /rss.xml`);
+  console.log(`   GET  /manual-fetch`);
+  console.log(`   Auto fetch every 6 hours | Auto-delete articles older than 90 days\n`);
 });
