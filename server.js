@@ -7,7 +7,7 @@ const fetch = require('node-fetch');
 const express = require('express');
 const cors = require('cors');
 const mongoose = require('mongoose');
-const Article = require('./models/article.js');
+const Article = require('./models/Article');
  
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -19,6 +19,13 @@ const SITE_URL = process.env.SITE_URL || 'https://newzyy.site';
 const WORLD_NEWS_API_KEY = process.env.WORLD_NEWS_API_KEY || 'e6031437382841f4921da3c6ba6ecd82';
 const CURRENTS_API_KEY = process.env.CURRENTS_API_KEY || 'kRjvwkCfg3uNzr1EYjYLSyTIatY-vq9FxxlBxt2Scb-JSfUu';
 const GUARDIAN_API_KEY = process.env.GUARDIAN_API_KEY || 'ab35f734-ceb0-4a49-bb7d-24c0c3331bd6';
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY; // set this in Render → Environment
+ 
+// Free tier: 15 requests/min, 1500 requests/day. Stay comfortably under both.
+const GEMINI_DELAY_MS = 4500;          // ~13 requests/min, safe margin under 15 RPM
+const GEMINI_MAX_PER_CYCLE = 300;      // 4 cycles/day × 300 = 1200, safe margin under 1500 RPD
+let geminiCallsToday = 0;
+let geminiDayStamp = new Date().toDateString();
  
 // ========== MONGODB CONNECTION ==========
 const MONGODB_URI = process.env.MONGODB_URI;
@@ -364,6 +371,55 @@ async function fetchFromGuardian(category) {
   }
 }
  
+// ========== GEMINI REWRITE ==========
+// Takes the raw facts from the 3 news APIs and asks Gemini to write an
+// original Newzyy article from them. Returns null on any failure so the
+// caller can fall back to the original excerpt (never breaks the pipeline).
+async function rewriteWithGemini(rawArticle, category) {
+  if (!GEMINI_API_KEY) return null;
+ 
+  const sourceFacts = (rawArticle.body || rawArticle.description || '').substring(0, 3000);
+  if (!sourceFacts.trim()) return null;
+ 
+  const prompt = `You are a staff news writer for "Newzyy", an independent news outlet.
+Using ONLY the facts below, write an original news article in your own words — do not copy sentences or phrasing from the source text.
+Length: 250-400 words. Tone: clear, neutral, professional news style.
+Output ONLY the article body text. No headline, no preamble, no markdown.
+ 
+Headline: ${rawArticle.title}
+Category: ${category}
+Source facts:
+${sourceFacts}`;
+ 
+  try {
+    const res = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] })
+      }
+    );
+    const data = await res.json();
+    const text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
+    return text && text.trim().length > 100 ? text.trim() : null;
+  } catch (e) {
+    console.error('   ⚠️ Gemini rewrite error:', e.message);
+    return null;
+  }
+}
+ 
+// Resets the daily Gemini call counter when the date rolls over
+// (RPD resets at midnight Pacific time — this local-date check is an
+// approximation that's safe to be conservative about).
+function checkGeminiDayReset() {
+  const today = new Date().toDateString();
+  if (today !== geminiDayStamp) {
+    geminiDayStamp = today;
+    geminiCallsToday = 0;
+  }
+}
+ 
 // ========== MAIN FETCH FUNCTION (now writes to MongoDB) ==========
 async function fetchAllNews() {
   console.log(`\n🔄 [${new Date().toLocaleTimeString()}] Starting 3-API news fetch...`);
@@ -400,20 +456,38 @@ async function fetchAllNews() {
       const titleLower = article.title.toLowerCase();
       if (existingTitles.has(titleLower)) continue;
  
+      // ----- Gemini rewrite (rate-limited, capped, safe fallback) -----
+      checkGeminiDayReset();
+      let finalBody = article.body || article.description || '';
+      let rewritten = false;
+ 
+      if (GEMINI_API_KEY && geminiCallsToday < GEMINI_MAX_PER_CYCLE) {
+        const rewrittenText = await rewriteWithGemini(article, cat);
+        geminiCallsToday++;
+        if (rewrittenText) {
+          finalBody = rewrittenText;
+          rewritten = true;
+        }
+        await new Promise(r => setTimeout(r, GEMINI_DELAY_MS)); // stay under 15 RPM
+      }
+ 
       try {
         await Article.create({
           id: `auto_${Date.now()}_${Math.random().toString(36).substring(2, 10)}`,
           category: cat,
           title: article.title,
           excerpt: (article.description || '').substring(0, 200),
-          body: article.body || article.description || '',
-          author: article.author || article.source,
+          body: finalBody,
+          author: rewritten ? 'Newzyy Staff' : (article.author || article.source),
           views: Math.floor(Math.random() * 5000) + 100,
           comments: Math.floor(Math.random() * 200),
           image: article.image || getCategoryImage(cat),
           status: 'published',
+          // Kept internally for editorial transparency, NOT shown as a "read more" CTA
+          // on rewritten articles — see single-post.html's source-line logic.
           source_url: article.url,
           source: article.source || 'News',
+          rewritten: rewritten,
           fetched_at: new Date()
         });
         existingTitles.add(titleLower);
