@@ -18,6 +18,7 @@ const articleSchema = new mongoose.Schema({
   status: { type: String, default: 'published', index: true },
   source_url: String,
   source: String,
+  rewritten: { type: Boolean, default: false }, // true = body was rewritten by Gemini, not copied
   fetched_at: { type: Date, default: Date.now, index: true }
 });
  
