@@ -523,7 +523,7 @@ async function fetchAllNews() {
       }
     }
 
-    if (newCount > 0) console.log(`   ✅ ${cat}: ${newCount} new articles added${skippedCount ? `, ${skippedCount} skipped (will retry next cycle)` : ''}`);
+    console.log(`   ✅ ${cat}: ${newCount} added, ${skippedCount} skipped (no rewrite / no key / cap reached)`);
     await new Promise(r => setTimeout(r, 300));
   }
 
@@ -540,6 +540,8 @@ async function fetchAllNews() {
   }
 
   console.log(`\n📊 SUMMARY: +${totalNew} new articles this cycle`);
+  console.log(`   Gemini key configured: ${GEMINI_API_KEY ? 'YES' : 'NO — set GEMINI_API_KEY in Render, nothing will publish without it'}`);
+  console.log(`   Gemini calls used today: ${geminiCallsToday}/${GEMINI_MAX_PER_DAY}`);
   console.log(`✅ Fetch completed at ${new Date().toLocaleTimeString()}\n`);
 }
 
