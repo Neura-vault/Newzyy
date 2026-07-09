@@ -7,7 +7,7 @@ const fetch = require('node-fetch');
 const express = require('express');
 const cors = require('cors');
 const mongoose = require('mongoose');
-const Article = require('./models/article.js');
+const Article = require('./models/Article');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -253,6 +253,24 @@ app.get('/rss.xml', async (req, res) => {
   }
 });
 
+// Strips HTML tags/entities from raw API text. Guardian's `fields.body` is real
+// HTML (<p>, <h2>, <a>, <figure>, <gu-atom>, <iframe> ...) — without this, those
+// tags leak into the article as visible text if they ever reach the page unrewritten.
+function stripHtml(html) {
+  if (!html) return '';
+  return html
+    .replace(/<figure[\s\S]*?<\/figure>/gi, ' ')   // drop embedded media blocks entirely
+    .replace(/<[^>]+>/g, ' ')                       // strip remaining tags
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&amp;/g, '&')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 // ========== API 1: WORLD NEWS API (Full Article) ==========
 async function fetchFromWorldNews(category) {
   if (!WORLD_NEWS_API_KEY) return [];
@@ -278,8 +296,8 @@ async function fetchFromWorldNews(category) {
 
         fullArticles.push({
           title: article.title || extractData.title,
-          description: article.text || extractData.text || '',
-          body: extractData.text || article.text || '',
+          description: stripHtml(article.text || extractData.text || ''),
+          body: stripHtml(extractData.text || article.text || ''),
           url: article.url || extractData.url,
           image: article.image || extractData.image,
           author: article.author || extractData.author || 'World News',
@@ -289,8 +307,8 @@ async function fetchFromWorldNews(category) {
       } catch (e) {
         fullArticles.push({
           title: article.title,
-          description: article.text || '',
-          body: article.text || '',
+          description: stripHtml(article.text || ''),
+          body: stripHtml(article.text || ''),
           url: article.url,
           image: article.image,
           author: article.author || 'World News',
@@ -325,8 +343,8 @@ async function fetchFromCurrents(category) {
 
     return data.news.filter(a => a.title && a.description).map(a => ({
       title: a.title,
-      description: a.description,
-      body: a.body || a.description,
+      description: stripHtml(a.description),
+      body: stripHtml(a.body || a.description),
       url: a.url,
       image: a.image || a.author_image,
       author: a.author || 'Currents',
@@ -357,8 +375,8 @@ async function fetchFromGuardian(category) {
 
     return data.response.results.map(a => ({
       title: a.webTitle || a.fields?.headline || 'Untitled',
-      description: a.fields?.trailText || '',
-      body: a.fields?.body || '',
+      description: stripHtml(a.fields?.trailText || ''),
+      body: stripHtml(a.fields?.body || ''),
       url: a.webUrl || a.url,
       image: a.fields?.thumbnail || '',
       author: a.fields?.byline || a.sectionName || 'The Guardian',
@@ -450,25 +468,32 @@ async function fetchAllNews() {
     console.log(`   World: ${world.length}, Currents: ${currents.length}, Guardian: ${guardian.length}, Total: ${allArticles.length}`);
 
     let newCount = 0;
+    let skippedCount = 0;
 
     for (const article of allArticles) {
       if (!article.title) continue;
       const titleLower = article.title.toLowerCase();
       if (existingTitles.has(titleLower)) continue;
 
-      // ----- Gemini rewrite (rate-limited, capped, safe fallback) -----
+      // ----- Gemini rewrite (rate-limited, capped) -----
+      // Only Gemini-rewritten text is ever published. If rewrite fails or the
+      // daily/rate cap is hit, this article is skipped (not saved) and will be
+      // retried automatically on the next fetch cycle — nothing is lost, and
+      // no raw/un-rewritten scraped text ever reaches the site.
       checkGeminiDayReset();
-      let finalBody = article.body || article.description || '';
-      let rewritten = false;
 
-      if (GEMINI_API_KEY && geminiCallsToday < GEMINI_MAX_PER_DAY) {
-        const rewrittenText = await rewriteWithGemini(article, cat);
-        geminiCallsToday++;
-        if (rewrittenText) {
-          finalBody = rewrittenText;
-          rewritten = true;
-        }
-        await new Promise(r => setTimeout(r, GEMINI_DELAY_MS)); // stay under 15 RPM
+      if (!GEMINI_API_KEY || geminiCallsToday >= GEMINI_MAX_PER_DAY) {
+        skippedCount++;
+        continue;
+      }
+
+      const rewrittenText = await rewriteWithGemini(article, cat);
+      geminiCallsToday++;
+      await new Promise(r => setTimeout(r, GEMINI_DELAY_MS)); // stay under 15 RPM
+
+      if (!rewrittenText) {
+        skippedCount++;
+        continue;
       }
 
       try {
@@ -477,17 +502,16 @@ async function fetchAllNews() {
           category: cat,
           title: article.title,
           excerpt: (article.description || '').substring(0, 200),
-          body: finalBody,
-          author: rewritten ? 'Newzyy Staff' : (article.author || article.source),
+          body: rewrittenText,
+          author: 'Newzyy Staff',
           views: Math.floor(Math.random() * 5000) + 100,
           comments: Math.floor(Math.random() * 200),
           image: article.image || getCategoryImage(cat),
           status: 'published',
-          // Kept internally for editorial transparency, NOT shown as a "read more" CTA
-          // on rewritten articles — see single-post.html's source-line logic.
+          // Kept internally for editorial record-keeping only — not shown on the site.
           source_url: article.url,
           source: article.source || 'News',
-          rewritten: rewritten,
+          rewritten: true,
           fetched_at: new Date()
         });
         existingTitles.add(titleLower);
@@ -499,7 +523,7 @@ async function fetchAllNews() {
       }
     }
 
-    if (newCount > 0) console.log(`   ✅ ${cat}: ${newCount} new articles added`);
+    if (newCount > 0) console.log(`   ✅ ${cat}: ${newCount} new articles added${skippedCount ? `, ${skippedCount} skipped (will retry next cycle)` : ''}`);
     await new Promise(r => setTimeout(r, 300));
   }
 
