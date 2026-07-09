@@ -7,7 +7,8 @@ const fetch = require('node-fetch');
 const express = require('express');
 const cors = require('cors');
 const mongoose = require('mongoose');
-const Article = require('./models/article.js');
+const sizeOf = require('image-size');
+const Article = require('./models/Article');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -21,11 +22,17 @@ const CURRENTS_API_KEY = process.env.CURRENTS_API_KEY || 'kRjvwkCfg3uNzr1EYjYLSy
 const GUARDIAN_API_KEY = process.env.GUARDIAN_API_KEY || 'ab35f734-ceb0-4a49-bb7d-24c0c3331bd6';
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY; // set this in Render → Environment
 
-// Free tier: 15 requests/min, 1500 requests/day. Stay comfortably under both.
-const GEMINI_DELAY_MS = 4500;          // ~13 requests/min, safe margin under 15 RPM
-const GEMINI_MAX_PER_DAY = 1200;       // safe margin under the 1500 RPD free-tier limit
+// This project's actual granted free-tier limit is much lower than Google's documented
+// defaults (its own error says "limit: 20") — likely because the account/project isn't
+// phone-verified yet. Go slow, and stop trying entirely for the rest of a cycle once
+// we detect we're being throttled, instead of burning through dozens of doomed requests.
+const GEMINI_DELAY_MS = 8000;             // conservative pace
+const GEMINI_MAX_PER_DAY = 1200;          // raise this once your real quota is confirmed higher
+const GEMINI_MAX_CONSECUTIVE_FAILURES = 3; // pause the rest of this cycle after this many 429s in a row
 let geminiCallsToday = 0;
 let geminiDayStamp = new Date().toDateString();
+let geminiConsecutiveFailures = 0;
+let geminiPausedThisCycle = false;
 
 // ========== MONGODB CONNECTION ==========
 const MONGODB_URI = process.env.MONGODB_URI;
@@ -389,6 +396,40 @@ async function fetchFromGuardian(category) {
   }
 }
 
+// ========== IMAGE VALIDATION ==========
+// Rejects: missing image, dead/broken links, non-image responses, and images too
+// small to look sharp at our display sizes (a cheap, reliable stand-in for true
+// blur detection — low-res images stretched to fill a 170-360px card are the
+// ones that look "blurry" in practice).
+const MIN_IMAGE_WIDTH = 400;
+const MIN_IMAGE_HEIGHT = 250;
+const MIN_IMAGE_BYTES = 8000; // filters out tiny placeholder/broken-icon images
+
+async function isGoodImage(url) {
+  if (!url) return false;
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 6000);
+    const res = await fetch(url, { signal: controller.signal });
+    clearTimeout(timeout);
+
+    if (!res.ok) return false;
+    const contentType = res.headers.get('content-type') || '';
+    if (!contentType.startsWith('image/')) return false;
+
+    const buffer = await res.buffer();
+    if (buffer.length < MIN_IMAGE_BYTES) return false;
+
+    const dimensions = sizeOf(buffer);
+    if (!dimensions.width || !dimensions.height) return false;
+    if (dimensions.width < MIN_IMAGE_WIDTH || dimensions.height < MIN_IMAGE_HEIGHT) return false;
+
+    return true;
+  } catch (e) {
+    return false; // any uncertainty (timeout, bad data, network error) = reject, never crash
+  }
+}
+
 // ========== GEMINI REWRITE ==========
 // Takes the raw facts from the 3 news APIs and asks Gemini to write an
 // original Newzyy article from them. Returns null on any failure so the
@@ -451,6 +492,8 @@ function checkGeminiDayReset() {
 // ========== MAIN FETCH FUNCTION (now writes to MongoDB) ==========
 async function fetchAllNews() {
   console.log(`\n🔄 [${new Date().toLocaleTimeString()}] Starting 3-API news fetch...`);
+  geminiPausedThisCycle = false;
+  geminiConsecutiveFailures = 0;
 
   // Load existing titles once, so we don't hit the DB per-article inside the loop.
   let existingTitles;
@@ -479,11 +522,21 @@ async function fetchAllNews() {
 
     let newCount = 0;
     let skippedCount = 0;
+    let skippedForImage = 0;
 
     for (const article of allArticles) {
       if (!article.title) continue;
       const titleLower = article.title.toLowerCase();
       if (existingTitles.has(titleLower)) continue;
+
+      // ----- Image check FIRST (cheap, no Gemini quota wasted on articles we'd reject anyway) -----
+      // No fallback stock photo anymore — if the source has no good image, the article
+      // simply isn't published. It'll be retried next cycle in case a better image turns up.
+      const hasGoodImage = await isGoodImage(article.image);
+      if (!hasGoodImage) {
+        skippedForImage++;
+        continue;
+      }
 
       // ----- Gemini rewrite (rate-limited, capped) -----
       // Only Gemini-rewritten text is ever published. If rewrite fails or the
@@ -492,19 +545,25 @@ async function fetchAllNews() {
       // no raw/un-rewritten scraped text ever reaches the site.
       checkGeminiDayReset();
 
-      if (!GEMINI_API_KEY || geminiCallsToday >= GEMINI_MAX_PER_DAY) {
+      if (!GEMINI_API_KEY || geminiCallsToday >= GEMINI_MAX_PER_DAY || geminiPausedThisCycle) {
         skippedCount++;
         continue;
       }
 
       const rewrittenText = await rewriteWithGemini(article, cat);
       geminiCallsToday++;
-      await new Promise(r => setTimeout(r, GEMINI_DELAY_MS)); // stay under 15 RPM
 
       if (!rewrittenText) {
+        geminiConsecutiveFailures++;
+        if (geminiConsecutiveFailures >= GEMINI_MAX_CONSECUTIVE_FAILURES) {
+          geminiPausedThisCycle = true;
+          console.log('   ⏸️ Gemini paused for the rest of this cycle after repeated errors — will retry next cycle.');
+        }
         skippedCount++;
         continue;
       }
+      geminiConsecutiveFailures = 0;
+      await new Promise(r => setTimeout(r, GEMINI_DELAY_MS));
 
       try {
         await Article.create({
@@ -516,7 +575,7 @@ async function fetchAllNews() {
           author: 'Newzyy Staff',
           views: Math.floor(Math.random() * 5000) + 100,
           comments: Math.floor(Math.random() * 200),
-          image: article.image || getCategoryImage(cat),
+          image: article.image,
           status: 'published',
           // Kept internally for editorial record-keeping only — not shown on the site.
           source_url: article.url,
@@ -533,7 +592,7 @@ async function fetchAllNews() {
       }
     }
 
-    console.log(`   ✅ ${cat}: ${newCount} added, ${skippedCount} skipped (no rewrite / no key / cap reached)`);
+    console.log(`   ✅ ${cat}: ${newCount} added, ${skippedForImage} skipped (bad/missing image), ${skippedCount} skipped (no rewrite / no key / cap reached)`);
     await new Promise(r => setTimeout(r, 300));
   }
 
