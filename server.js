@@ -419,8 +419,18 @@ ${sourceFacts}`;
       }
     );
     const data = await res.json();
+
+    if (!res.ok || data.error) {
+      console.error(`   ⚠️ Gemini API error [${res.status}]:`, data.error?.message || JSON.stringify(data));
+      return null;
+    }
+
     const text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
-    return text && text.trim().length > 100 ? text.trim() : null;
+    if (!text) {
+      console.error('   ⚠️ Gemini returned no text. Full response:', JSON.stringify(data).substring(0, 500));
+      return null;
+    }
+    return text.trim().length > 100 ? text.trim() : null;
   } catch (e) {
     console.error('   ⚠️ Gemini rewrite error:', e.message);
     return null;
