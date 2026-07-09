@@ -7,7 +7,7 @@ const fetch = require('node-fetch');
 const express = require('express');
 const cors = require('cors');
 const mongoose = require('mongoose');
-const Article = require('./models/Article');
+const Article = require('./models/article.js');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
