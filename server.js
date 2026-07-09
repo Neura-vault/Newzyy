@@ -8,7 +8,7 @@ const express = require('express');
 const cors = require('cors');
 const mongoose = require('mongoose');
 const sizeOf = require('image-size');
-const Article = require('./models/Article');
+const Article = require('./models/article.js');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
