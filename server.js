@@ -89,15 +89,15 @@ const GUARDIAN_CATEGORY_QUERY = {
 // no API key needed. Only categories with a real matching feed are listed;
 // the rest rely on Guardian alone, which is enough on its own.
 const RSS_FEEDS = {
-  politics: 'https://feeds.reuters.com/Reuters/PoliticsNews',
+  politics: 'https://feeds.bbci.co.uk/news/politics/rss.xml',
   world: 'https://feeds.bbci.co.uk/news/world/rss.xml',
   technology: 'https://techcrunch.com/feed/',
-  Ai: 'https://www.technologyreview.com/topic/artificial-intelligence/feed/',
+  ai: 'https://www.technologyreview.com/topic/artificial-intelligence/feed/',
   business: 'https://feeds.bbci.co.uk/news/business/rss.xml',
-  economy: 'https://feeds.reuters.com/news/economy',
+  economy: 'https://www.worldbank.org/en/news/all?format=rss',
   health: 'https://feeds.bbci.co.uk/news/health/rss.xml',
   science: 'https://feeds.bbci.co.uk/news/science_and_environment/rss.xml',
-  environment: 'https://feeds.bbci.co.uk/news/health/rss.xml',
+  environment: 'https://news.mongabay.com/feed/',
   sports: 'https://feeds.bbci.co.uk/sport/rss.xml',
   entertainment: 'https://feeds.bbci.co.uk/news/entertainment_and_arts/rss.xml',
   culture: 'https://www.smithsonianmag.com/rss/arts-culture/',
