@@ -8,7 +8,18 @@ const express = require('express');
 const cors = require('cors');
 const mongoose = require('mongoose');
 const sizeOf = require('image-size');
+const RSSParser = require('rss-parser');
 const Article = require('./models/article.js');
+
+const rssParser = new RSSParser({
+  timeout: 8000,
+  customFields: {
+    item: [
+      ['media:thumbnail', 'mediaThumbnail'],
+      ['media:content', 'mediaContent']
+    ]
+  }
+});
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -22,17 +33,15 @@ const CURRENTS_API_KEY = process.env.CURRENTS_API_KEY || 'kRjvwkCfg3uNzr1EYjYLSy
 const GUARDIAN_API_KEY = process.env.GUARDIAN_API_KEY || 'ab35f734-ceb0-4a49-bb7d-24c0c3331bd6';
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY; // set this in Render → Environment
 
-// This project's actual granted free-tier limit is much lower than Google's documented
-// defaults (its own error says "limit: 20") — likely because the account/project isn't
-// phone-verified yet. Go slow, and stop trying entirely for the rest of a cycle once
-// we detect we're being throttled, instead of burning through dozens of doomed requests.
-const GEMINI_DELAY_MS = 8000;             // conservative pace
-const GEMINI_MAX_PER_DAY = 1200;          // raise this once your real quota is confirmed higher
-const GEMINI_MAX_CONSECUTIVE_FAILURES = 3; // pause the rest of this cycle after this many 429s in a row
+// This project's actual granted free-tier limit is lower than Google's documented
+// defaults (its own error says "limit: 20"). Rather than guess a fixed pace, we read
+// Google's own suggested wait time from each 429 response and back off exactly that
+// long — self-adjusting to whatever the real limit is, never guessing wrong.
+const GEMINI_DELAY_MS = 6000;              // base spacing between successful calls
+const GEMINI_MAX_PER_DAY = 1200;           // safety ceiling only — raise once real quota is confirmed higher
+const GEMINI_MAX_ROUNDS_PER_CYCLE = 20;    // cap how many articles per category one cycle will attempt
 let geminiCallsToday = 0;
 let geminiDayStamp = new Date().toDateString();
-let geminiConsecutiveFailures = 0;
-let geminiPausedThisCycle = false;
 
 // ========== MONGODB CONNECTION ==========
 const MONGODB_URI = process.env.MONGODB_URI;
@@ -53,22 +62,42 @@ app.get('/', (req, res) => {
 
 // ========== CATEGORIES ==========
 const CATEGORIES = [
-  'politics', 'technology', 'sports', 'business', 'health',
+  'politics', 'technology', 'ai', 'sports', 'business', 'health',
   'science', 'entertainment', 'travel', 'environment', 'culture', 'world', 'economy'
 ];
 
-function getCategoryImage(cat) {
-  const images = {
-    technology: 'https://images.unsplash.com/photo-1518770660439-4636190af475?w=800&q=80',
-    sports: 'https://images.unsplash.com/photo-1461896836934-ffe607ba8211?w=800&q=80',
-    business: 'https://images.unsplash.com/photo-1551288049-bebda4e38f71?w=800&q=80',
-    health: 'https://images.unsplash.com/photo-1505751172876-fa1923c5c528?w=800&q=80',
-    politics: 'https://images.unsplash.com/photo-1529107386315-e1a2ed48a620?w=800&q=80',
-    science: 'https://images.unsplash.com/photo-1451187580459-43490279c0fa?w=800&q=80',
-    entertainment: 'https://images.unsplash.com/photo-1598899134739-24c46f58b8c0?w=800&q=80'
-  };
-  return images[cat] || images.technology;
-}
+// Every category has its OWN dedicated Guardian query (never shares another
+// category's results) — either a specific section, or a free-text search when
+// no matching section exists. This is the primary source for every category.
+const GUARDIAN_CATEGORY_QUERY = {
+  politics: { section: 'politics' },
+  world: { section: 'world' },
+  technology: { section: 'technology' },
+  ai: { search: 'artificial intelligence' },
+  business: { section: 'business' },
+  economy: { search: 'economy OR economic OR inflation OR "interest rates"' },
+  health: { search: 'health' },
+  science: { section: 'science' },
+  environment: { section: 'environment' },
+  sports: { section: 'sport' },
+  entertainment: { search: 'entertainment OR celebrity OR film OR music OR television' },
+  culture: { section: 'culture' },
+  travel: { section: 'travel' }
+};
+
+// Secondary source for extra volume — official BBC RSS feeds, one per category,
+// no API key needed. Only categories with a real matching BBC feed are listed;
+// the rest rely on Guardian alone, which is enough on its own.
+const BBC_RSS_FEEDS = {
+  politics: 'https://feeds.bbci.co.uk/news/politics/rss.xml',
+  world: 'https://feeds.bbci.co.uk/news/world/rss.xml',
+  technology: 'https://feeds.bbci.co.uk/news/technology/rss.xml',
+  business: 'https://feeds.bbci.co.uk/news/business/rss.xml',
+  health: 'https://feeds.bbci.co.uk/news/health/rss.xml',
+  science: 'https://feeds.bbci.co.uk/news/science_and_environment/rss.xml',
+  sports: 'https://feeds.bbci.co.uk/sport/rss.xml',
+  entertainment: 'https://feeds.bbci.co.uk/news/entertainment_and_arts/rss.xml'
+};
 
 // Time string is now computed live at READ time, never stored — so it never goes stale.
 function formatTimeAgo(dateValue) {
@@ -278,102 +307,16 @@ function stripHtml(html) {
     .trim();
 }
 
-// ========== API 1: WORLD NEWS API (Full Article) ==========
-async function fetchFromWorldNews(category) {
-  if (!WORLD_NEWS_API_KEY) return [];
-
-  const worldCatMap = {
-    technology: 'tech', sports: 'sports', business: 'business', health: 'health',
-    politics: 'politics', science: 'science', entertainment: 'entertainment'
-  };
-  const cat = worldCatMap[category] || category;
-  const url = `https://api.worldnewsapi.com/search-news?text=${cat}&language=en&sort=publish-time&number=15&api-key=${WORLD_NEWS_API_KEY}`;
-
-  try {
-    const response = await fetch(url);
-    const data = await response.json();
-    if (!data.news || data.news.length === 0) return [];
-
-    const fullArticles = [];
-    for (const article of data.news) {
-      try {
-        const extractUrl = `https://api.worldnewsapi.com/extract-news?url=${encodeURIComponent(article.url)}&api-key=${WORLD_NEWS_API_KEY}`;
-        const extractRes = await fetch(extractUrl);
-        const extractData = await extractRes.json();
-
-        fullArticles.push({
-          title: article.title || extractData.title,
-          description: stripHtml(article.text || extractData.text || ''),
-          body: stripHtml(extractData.text || article.text || ''),
-          url: article.url || extractData.url,
-          image: article.image || extractData.image,
-          author: article.author || extractData.author || 'World News',
-          publishedAt: article.publish_date || new Date().toISOString(),
-          source: 'World News'
-        });
-      } catch (e) {
-        fullArticles.push({
-          title: article.title,
-          description: stripHtml(article.text || ''),
-          body: stripHtml(article.text || ''),
-          url: article.url,
-          image: article.image,
-          author: article.author || 'World News',
-          publishedAt: article.publish_date || new Date().toISOString(),
-          source: 'World News'
-        });
-      }
-      await new Promise(r => setTimeout(r, 200));
-    }
-    return fullArticles;
-  } catch (e) {
-    console.error('World News API error:', e.message);
-    return [];
-  }
-}
-
-// ========== API 2: CURRENTS API ==========
-async function fetchFromCurrents(category) {
-  if (!CURRENTS_API_KEY) return [];
-
-  const categoryMap = {
-    technology: 'tech', sports: 'sports', business: 'business', health: 'health',
-    politics: 'politics', science: 'science', entertainment: 'entertainment'
-  };
-  const cat = categoryMap[category] || category;
-  const url = `https://api.currentsapi.services/v1/latest-news?category=${cat}&language=en&apiKey=${CURRENTS_API_KEY}&page_size=15`;
-
-  try {
-    const response = await fetch(url);
-    const data = await response.json();
-    if (!data.news) return [];
-
-    return data.news.filter(a => a.title && a.description).map(a => ({
-      title: a.title,
-      description: stripHtml(a.description),
-      body: stripHtml(a.body || a.description),
-      url: a.url,
-      image: a.image || a.author_image,
-      author: a.author || 'Currents',
-      publishedAt: a.published || new Date().toISOString(),
-      source: 'Currents'
-    }));
-  } catch (e) {
-    console.error('Currents API error:', e.message);
-    return [];
-  }
-}
-
-// ========== API 3: GUARDIAN API ==========
-async function fetchFromGuardian(category) {
+// ========== SOURCE 1: GUARDIAN (dedicated query per category) ==========
+async function fetchGuardianForCategory(cat) {
   if (!GUARDIAN_API_KEY) return [];
+  const q = GUARDIAN_CATEGORY_QUERY[cat];
+  if (!q) return [];
 
-  const guardianCategories = {
-    technology: 'technology', sports: 'sport', business: 'business', health: 'health',
-    politics: 'politics', science: 'science', entertainment: 'culture'
-  };
-  const cat = guardianCategories[category] || category;
-  const url = `https://content.guardianapis.com/search?section=${cat}&api-key=${GUARDIAN_API_KEY}&show-fields=body,thumbnail,trailText&page-size=15&order-by=newest`;
+  const base = q.section
+    ? `section=${encodeURIComponent(q.section)}`
+    : `q=${encodeURIComponent(q.search)}`;
+  const url = `https://content.guardianapis.com/search?${base}&api-key=${GUARDIAN_API_KEY}&show-fields=body,thumbnail,trailText&page-size=15&order-by=newest`;
 
   try {
     const response = await fetch(url);
@@ -391,9 +334,55 @@ async function fetchFromGuardian(category) {
       source: 'The Guardian'
     }));
   } catch (e) {
-    console.error('Guardian API error:', e.message);
-    return [];
+    console.error(`   ⚠️ Guardian fetch failed for ${cat}:`, e.message);
+    return []; // never throw — an empty array just means this source contributed nothing this cycle
   }
+}
+
+// ========== SOURCE 2: BBC RSS (dedicated feed per category, no key needed) ==========
+async function fetchBBCRSS(cat) {
+  const feedUrl = BBC_RSS_FEEDS[cat];
+  if (!feedUrl) return [];
+
+  try {
+    const feed = await rssParser.parseURL(feedUrl);
+    if (!feed || !feed.items) return [];
+
+    return feed.items.slice(0, 15).map(item => {
+      let image = '';
+      try {
+        if (item.mediaThumbnail?.$?.url) image = item.mediaThumbnail.$.url;
+        else if (item.mediaContent?.$?.url) image = item.mediaContent.$.url;
+        else if (item.enclosure?.url) image = item.enclosure.url;
+      } catch (e) { /* image is optional — safe to leave blank, isGoodImage() handles it */ }
+
+      const text = stripHtml(item.contentSnippet || item.content || '');
+      return {
+        title: item.title || '',
+        description: text,
+        body: text,
+        url: item.link || '',
+        image,
+        author: 'BBC News',
+        publishedAt: item.pubDate || new Date().toISOString(),
+        source: 'BBC'
+      };
+    });
+  } catch (e) {
+    console.error(`   ⚠️ BBC RSS fetch failed for ${cat}:`, e.message);
+    return []; // never throw — this category just falls back to Guardian-only this cycle
+  }
+}
+
+// ========== COMBINE BOTH SOURCES FOR ONE CATEGORY ==========
+// Each category is fully independent — a failure in one source, or one category,
+// can never affect any other category.
+async function fetchCategorySources(cat) {
+  const [guardianArticles, bbcArticles] = await Promise.all([
+    fetchGuardianForCategory(cat),
+    fetchBBCRSS(cat)
+  ]);
+  return [...guardianArticles, ...bbcArticles];
 }
 
 // ========== IMAGE VALIDATION ==========
@@ -435,14 +424,15 @@ async function isGoodImage(url) {
 // original Newzyy article from them. Returns null on any failure so the
 // caller can fall back to the original excerpt (never breaks the pipeline).
 async function rewriteWithGemini(rawArticle, category) {
-  if (!GEMINI_API_KEY) return null;
+  if (!GEMINI_API_KEY) return { text: null, retryAfterMs: 0 };
 
   const sourceFacts = (rawArticle.body || rawArticle.description || '').substring(0, 3000);
-  if (!sourceFacts.trim()) return null;
+  if (!sourceFacts.trim()) return { text: null, retryAfterMs: 0 };
 
   const prompt = `You are a staff news writer for "Newzyy", an independent news outlet.
 Using ONLY the facts below, write an original news article in your own words — do not copy sentences or phrasing from the source text.
-Length: 250-400 words. Tone: clear, neutral, professional news style.
+If the source facts are limited, write a shorter article rather than inventing extra details, numbers, quotes, or names that aren't in the source.
+Length: 150-400 words depending on how much source material is available. Tone: clear, neutral, professional news style.
 Output ONLY the article body text. No headline, no preamble, no markdown.
 
 Headline: ${rawArticle.title}
@@ -462,19 +452,26 @@ ${sourceFacts}`;
     const data = await res.json();
 
     if (!res.ok || data.error) {
-      console.error(`   ⚠️ Gemini API error [${res.status}]:`, data.error?.message || JSON.stringify(data));
-      return null;
+      let retryAfterMs = 0;
+      const details = data.error?.details || [];
+      const retryInfo = details.find(d => (d['@type'] || '').includes('RetryInfo'));
+      if (retryInfo?.retryDelay) {
+        const seconds = parseFloat(String(retryInfo.retryDelay).replace('s', ''));
+        if (!isNaN(seconds)) retryAfterMs = Math.min(Math.ceil(seconds * 1000), 70000); // cap at 70s, sanity limit
+      }
+      console.error(`   ⚠️ Gemini API error [${res.status}]:`, data.error?.message || JSON.stringify(data).substring(0, 300));
+      return { text: null, retryAfterMs };
     }
 
     const text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
     if (!text) {
       console.error('   ⚠️ Gemini returned no text. Full response:', JSON.stringify(data).substring(0, 500));
-      return null;
+      return { text: null, retryAfterMs: 0 };
     }
-    return text.trim().length > 100 ? text.trim() : null;
+    return { text: text.trim().length > 80 ? text.trim() : null, retryAfterMs: 0 };
   } catch (e) {
     console.error('   ⚠️ Gemini rewrite error:', e.message);
-    return null;
+    return { text: null, retryAfterMs: 0 };
   }
 }
 
@@ -489,11 +486,10 @@ function checkGeminiDayReset() {
   }
 }
 
-// ========== MAIN FETCH FUNCTION (now writes to MongoDB) ==========
+// ========== MAIN FETCH FUNCTION (now writes to MongoDB, round-robin across categories) ==========
 async function fetchAllNews() {
-  console.log(`\n🔄 [${new Date().toLocaleTimeString()}] Starting 3-API news fetch...`);
-  geminiPausedThisCycle = false;
-  geminiConsecutiveFailures = 0;
+  console.log(`\n🔄 [${new Date().toLocaleTimeString()}] Starting news fetch (Guardian + BBC RSS, per category)...`);
+  checkGeminiDayReset();
 
   // Load existing titles once, so we don't hit the DB per-article inside the loop.
   let existingTitles;
@@ -506,63 +502,63 @@ async function fetchAllNews() {
     existingTitles = new Set();
   }
 
-  let totalNew = 0;
-
+  // ----- Step 1: fetch raw candidates for every category first, each fully independent -----
+  const candidatesByCategory = {};
   for (const cat of CATEGORIES) {
-    console.log(`\n📰 Fetching ${cat}...`);
+    const raw = await fetchCategorySources(cat);
+    const fresh = raw.filter(a => a.title && !existingTitles.has(a.title.toLowerCase()));
+    candidatesByCategory[cat] = fresh;
+    console.log(`📰 ${cat}: ${raw.length} fetched, ${fresh.length} new`);
+    await new Promise(r => setTimeout(r, 250)); // small courtesy delay between source calls
+  }
 
-    const [world, currents, guardian] = await Promise.all([
-      fetchFromWorldNews(cat),
-      fetchFromCurrents(cat),
-      fetchFromGuardian(cat)
-    ]);
+  // ----- Step 2: round-robin through categories one article at a time -----
+  // This is the key fairness fix: instead of exhausting the Gemini budget on
+  // whichever category happens to run first, every category gets a turn before
+  // any category gets a second turn. If the budget runs out mid-way, every
+  // category has already had a roughly equal share, not just the first few.
+  const stats = {};
+  CATEGORIES.forEach(c => (stats[c] = { added: 0, skippedImage: 0, skippedGemini: 0 }));
 
-    const allArticles = [...world, ...currents, ...guardian];
-    console.log(`   World: ${world.length}, Currents: ${currents.length}, Guardian: ${guardian.length}, Total: ${allArticles.length}`);
+  let totalNew = 0;
+  let round = 0;
 
-    let newCount = 0;
-    let skippedCount = 0;
-    let skippedForImage = 0;
+  while (round < GEMINI_MAX_ROUNDS_PER_CYCLE) {
+    let anyCategoryHadCandidate = false;
 
-    for (const article of allArticles) {
-      if (!article.title) continue;
+    for (const cat of CATEGORIES) {
+      const list = candidatesByCategory[cat];
+      if (round >= list.length) continue; // this category's candidates are exhausted
+      anyCategoryHadCandidate = true;
+
+      const article = list[round];
       const titleLower = article.title.toLowerCase();
-      if (existingTitles.has(titleLower)) continue;
+      if (existingTitles.has(titleLower)) continue; // could have been added by an earlier round this same cycle
 
-      // ----- Image check FIRST (cheap, no Gemini quota wasted on articles we'd reject anyway) -----
-      // No fallback stock photo anymore — if the source has no good image, the article
-      // simply isn't published. It'll be retried next cycle in case a better image turns up.
+      // ----- Image check first (cheap, saves wasting a Gemini call on articles we'd reject anyway) -----
       const hasGoodImage = await isGoodImage(article.image);
       if (!hasGoodImage) {
-        skippedForImage++;
+        stats[cat].skippedImage++;
         continue;
       }
 
-      // ----- Gemini rewrite (rate-limited, capped) -----
-      // Only Gemini-rewritten text is ever published. If rewrite fails or the
-      // daily/rate cap is hit, this article is skipped (not saved) and will be
-      // retried automatically on the next fetch cycle — nothing is lost, and
-      // no raw/un-rewritten scraped text ever reaches the site.
-      checkGeminiDayReset();
-
-      if (!GEMINI_API_KEY || geminiCallsToday >= GEMINI_MAX_PER_DAY || geminiPausedThisCycle) {
-        skippedCount++;
+      // ----- Gemini rewrite -----
+      if (!GEMINI_API_KEY || geminiCallsToday >= GEMINI_MAX_PER_DAY) {
+        stats[cat].skippedGemini++;
         continue;
       }
 
-      const rewrittenText = await rewriteWithGemini(article, cat);
+      const result = await rewriteWithGemini(article, cat);
       geminiCallsToday++;
 
-      if (!rewrittenText) {
-        geminiConsecutiveFailures++;
-        if (geminiConsecutiveFailures >= GEMINI_MAX_CONSECUTIVE_FAILURES) {
-          geminiPausedThisCycle = true;
-          console.log('   ⏸️ Gemini paused for the rest of this cycle after repeated errors — will retry next cycle.');
-        }
-        skippedCount++;
+      if (!result.text) {
+        stats[cat].skippedGemini++;
+        // Self-adjusting backoff: if Google told us how long to wait, honor it
+        // exactly instead of guessing. Otherwise use the normal spacing.
+        await new Promise(r => setTimeout(r, result.retryAfterMs || GEMINI_DELAY_MS));
         continue;
       }
-      geminiConsecutiveFailures = 0;
+
       await new Promise(r => setTimeout(r, GEMINI_DELAY_MS));
 
       try {
@@ -571,7 +567,7 @@ async function fetchAllNews() {
           category: cat,
           title: article.title,
           excerpt: (article.description || '').substring(0, 200),
-          body: rewrittenText,
+          body: result.text,
           author: 'Newzyy Staff',
           views: Math.floor(Math.random() * 5000) + 100,
           comments: Math.floor(Math.random() * 200),
@@ -584,17 +580,21 @@ async function fetchAllNews() {
           fetched_at: new Date()
         });
         existingTitles.add(titleLower);
-        newCount++;
+        stats[cat].added++;
         totalNew++;
       } catch (e) {
-        // Duplicate key or validation error — skip quietly, not fatal.
-        if (e.code !== 11000) console.error('   ⚠️ Save error:', e.message);
+        if (e.code !== 11000) console.error(`   ⚠️ Save error [${cat}]:`, e.message);
       }
     }
 
-    console.log(`   ✅ ${cat}: ${newCount} added, ${skippedForImage} skipped (bad/missing image), ${skippedCount} skipped (no rewrite / no key / cap reached)`);
-    await new Promise(r => setTimeout(r, 300));
+    if (!anyCategoryHadCandidate) break; // every category's candidate list is exhausted
+    round++;
   }
+
+  CATEGORIES.forEach(cat => {
+    const s = stats[cat];
+    console.log(`   ✅ ${cat}: ${s.added} added, ${s.skippedImage} skipped (bad/missing image), ${s.skippedGemini} skipped (rewrite/quota)`);
+  });
 
   // Retention: 90 days, not 3 — permanent-ish URLs matter for SEO and social shares.
   // MongoDB free tier is 512MB, which comfortably holds well over 100,000 articles
@@ -662,7 +662,7 @@ app.get('/manual-fetch', async (req, res) => {
 
 // ========== START SCHEDULE ==========
 mongoose.connection.once('open', () => {
-  console.log('📰 Initializing 3-API news fetcher (World + Currents + Guardian)...');
+  console.log('📰 Initializing news fetcher (Guardian + BBC RSS, dedicated per category, Gemini rewrite)...');
   fetchAllNews().catch(console.error);
 
   setInterval(async () => {
@@ -674,7 +674,7 @@ mongoose.connection.once('open', () => {
 // ========== START SERVER ==========
 app.listen(PORT, () => {
   console.log(`\n🚀 Server running on port ${PORT}`);
-  console.log(`   🔥 World News API + Currents + Guardian (MongoDB storage)`);
+  console.log(`   🔥 Guardian + BBC RSS per category, Gemini-rewritten, MongoDB storage`);
   console.log(`   GET  /api/all-news?page=1&limit=20&category=technology`);
   console.log(`   GET  /api/article/:id`);
   console.log(`   GET  /api/category/:slug`);
