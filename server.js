@@ -85,8 +85,8 @@ const GUARDIAN_CATEGORY_QUERY = {
   travel: { section: 'travel' }
 };
 
-// Secondary source for extra volume — official BBC RSS feeds, one per category,
-// no API key needed. Only categories with a real matching BBC feed are listed;
+// Secondary source for extra volume — official RSS feeds, one per category,
+// no API key needed. Only categories with a real matching feed are listed;
 // the rest rely on Guardian alone, which is enough on its own.
 const RSS_FEEDS = {
   politics: 'https://feeds.reuters.com/Reuters/PoliticsNews',
@@ -344,9 +344,9 @@ async function fetchGuardianForCategory(cat) {
   }
 }
 
-// ========== SOURCE 2: BBC RSS (dedicated feed per category, no key needed) ==========
-async function fetchBBCRSS(cat) {
-  const feedUrl = BBC_RSS_FEEDS[cat];
+// ========== SOURCE 2: RSS (dedicated feed per category, no key needed) ==========
+async function fetchRSS(cat) {
+  const feedUrl = RSS_FEEDS[cat];
   if (!feedUrl) return [];
 
   try {
@@ -368,13 +368,13 @@ async function fetchBBCRSS(cat) {
         body: text,
         url: item.link || '',
         image,
-        author: 'BBC News',
+        author: 'News',
         publishedAt: item.pubDate || new Date().toISOString(),
-        source: 'BBC'
+        source: 'RSS-FEED'
       };
     });
   } catch (e) {
-    console.error(`   ⚠️ BBC RSS fetch failed for ${cat}:`, e.message);
+    console.error(`   ⚠️ RSS fetch failed for ${cat}:`, e.message);
     return []; // never throw — this category just falls back to Guardian-only this cycle
   }
 }
@@ -383,11 +383,11 @@ async function fetchBBCRSS(cat) {
 // Each category is fully independent — a failure in one source, or one category,
 // can never affect any other category.
 async function fetchCategorySources(cat) {
-  const [guardianArticles, bbcArticles] = await Promise.all([
+  const [guardianArticles, Articles] = await Promise.all([
     fetchGuardianForCategory(cat),
-    fetchBBCRSS(cat)
+    fetchRSS(cat)
   ]);
-  return [...guardianArticles, ...bbcArticles];
+  return [...guardianArticles, ...Articles];
 }
 
 // ========== IMAGE VALIDATION ==========
@@ -493,7 +493,7 @@ function checkGeminiDayReset() {
 
 // ========== MAIN FETCH FUNCTION (now writes to MongoDB, round-robin across categories) ==========
 async function fetchAllNews() {
-  console.log(`\n🔄 [${new Date().toLocaleTimeString()}] Starting news fetch (Guardian + BBC RSS, per category)...`);
+  console.log(`\n🔄 [${new Date().toLocaleTimeString()}] Starting news fetch (Guardian + RSS, per category)...`);
   checkGeminiDayReset();
 
   // Load existing titles once, so we don't hit the DB per-article inside the loop.
@@ -667,7 +667,7 @@ app.get('/manual-fetch', async (req, res) => {
 
 // ========== START SCHEDULE ==========
 mongoose.connection.once('open', () => {
-  console.log('📰 Initializing news fetcher (Guardian + BBC RSS, dedicated per category, Gemini rewrite)...');
+  console.log('📰 Initializing news fetcher (Guardian + RSS, dedicated per category, Gemini rewrite)...');
   fetchAllNews().catch(console.error);
 
   setInterval(async () => {
@@ -679,7 +679,7 @@ mongoose.connection.once('open', () => {
 // ========== START SERVER ==========
 app.listen(PORT, () => {
   console.log(`\n🚀 Server running on port ${PORT}`);
-  console.log(`   🔥 Guardian + BBC RSS per category, Gemini-rewritten, MongoDB storage`);
+  console.log(`   🔥 Guardian + RSS per category, Gemini-rewritten, MongoDB storage`);
   console.log(`   GET  /api/all-news?page=1&limit=20&category=technology`);
   console.log(`   GET  /api/article/:id`);
   console.log(`   GET  /api/category/:slug`);
