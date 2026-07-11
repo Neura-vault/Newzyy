@@ -73,14 +73,14 @@ const GUARDIAN_CATEGORY_QUERY = {
   politics: { section: 'politics' },
   world: { section: 'world' },
   technology: { section: 'technology' },
-  ai: { search: 'artificial intelligence' },
+  ai: { section: 'artificial intelligence' },
   business: { section: 'business' },
-  economy: { search: 'economy OR economic OR inflation OR "interest rates"' },
-  health: { search: 'health' },
+  economy: { section: 'economy OR economic OR inflation OR "interest rates"' },
+  health: { section: 'health' },
   science: { section: 'science' },
   environment: { section: 'environment' },
   sports: { section: 'sport' },
-  entertainment: { search: 'entertainment OR celebrity OR film OR music OR television' },
+  entertainment: { section: 'entertainment OR celebrity OR film OR music OR television' },
   culture: { section: 'culture' },
   travel: { section: 'travel' }
 };
@@ -88,15 +88,20 @@ const GUARDIAN_CATEGORY_QUERY = {
 // Secondary source for extra volume — official BBC RSS feeds, one per category,
 // no API key needed. Only categories with a real matching BBC feed are listed;
 // the rest rely on Guardian alone, which is enough on its own.
-const BBC_RSS_FEEDS = {
-  politics: 'https://feeds.bbci.co.uk/news/politics/rss.xml',
+const RSS_FEEDS = {
+  politics: 'https://feeds.reuters.com/Reuters/PoliticsNews',
   world: 'https://feeds.bbci.co.uk/news/world/rss.xml',
-  technology: 'https://feeds.bbci.co.uk/news/technology/rss.xml',
+  technology: 'https://techcrunch.com/feed/',
+  Ai: 'https://www.technologyreview.com/topic/artificial-intelligence/feed/',
   business: 'https://feeds.bbci.co.uk/news/business/rss.xml',
+  economy: 'https://feeds.reuters.com/news/economy',
   health: 'https://feeds.bbci.co.uk/news/health/rss.xml',
   science: 'https://feeds.bbci.co.uk/news/science_and_environment/rss.xml',
+  environment: 'https://feeds.bbci.co.uk/news/health/rss.xml',
   sports: 'https://feeds.bbci.co.uk/sport/rss.xml',
-  entertainment: 'https://feeds.bbci.co.uk/news/entertainment_and_arts/rss.xml'
+  entertainment: 'https://feeds.bbci.co.uk/news/entertainment_and_arts/rss.xml',
+  culture: 'https://www.smithsonianmag.com/rss/arts-culture/',
+  travel: 'https://www.cntraveler.com/feed/rss',
 };
 
 // Time string is now computed live at READ time, never stored — so it never goes stale.
