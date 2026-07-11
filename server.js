@@ -94,7 +94,7 @@ const RSS_FEEDS = {
   technology: 'https://techcrunch.com/feed/',
   ai: 'https://www.technologyreview.com/topic/artificial-intelligence/feed/',
   business: 'https://feeds.bbci.co.uk/news/business/rss.xml',
-  economy: 'https://www.worldbank.org/en/news/all?format=rss',
+  economy: 'https://news.google.com/rss/search?q=economy&hl=en-US&gl=US&ceid=US:en',
   health: 'https://feeds.bbci.co.uk/news/health/rss.xml',
   science: 'https://feeds.bbci.co.uk/news/science_and_environment/rss.xml',
   environment: 'https://news.mongabay.com/feed/',
