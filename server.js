@@ -1,6 +1,6 @@
 // ════════════════════════════════════════════════════════════
-//  NEWZYY — World News API + Currents + Guardian (MongoDB storage)
-//  v2.0 — Migrated from /tmp file storage to MongoDB Atlas
+//  NEWZYY — Guardian + diverse RSS sources, per category
+//  v2.1 — MongoDB storage, Gemini rewrite, fair round-robin
 // ════════════════════════════════════════════════════════════
 
 const fetch = require('node-fetch');
@@ -9,7 +9,16 @@ const cors = require('cors');
 const mongoose = require('mongoose');
 const sizeOf = require('image-size');
 const RSSParser = require('rss-parser');
-const Article = require('./models/article.js');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+const rateLimit = require('express-rate-limit');
+const crypto = require('crypto');
+const Article = require('./models/Article');
+const User = require('./models/User');
+const ContactMessage = require('./models/ContactMessage');
+const { sendVerificationEmail, sendContactNotification } = require('./utils/mailer'); // FIX: was './models/article.js' (lowercase) — Render
+                                              // is case-sensitive (Linux); the real file is Article.js.
+                                              // This exact mismatch crashes the whole server on deploy.
 
 const rssParser = new RSSParser({
   timeout: 8000,
@@ -28,10 +37,10 @@ const PORT = process.env.PORT || 3001;
 const SITE_URL = process.env.SITE_URL || 'https://newzyy.site';
 
 // ========== API KEYS ==========
-const WORLD_NEWS_API_KEY = process.env.WORLD_NEWS_API_KEY || 'e6031437382841f4921da3c6ba6ecd82';
-const CURRENTS_API_KEY = process.env.CURRENTS_API_KEY || 'kRjvwkCfg3uNzr1EYjYLSyTIatY-vq9FxxlBxt2Scb-JSfUu';
 const GUARDIAN_API_KEY = process.env.GUARDIAN_API_KEY || 'ab35f734-ceb0-4a49-bb7d-24c0c3331bd6';
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY; // set this in Render → Environment
+const JWT_SECRET = process.env.JWT_SECRET; // set this in Render → Environment — long random string
+const VERIFICATION_CODE_TTL_MIN = 15;
 
 // This project's actual granted free-tier limit is lower than Google's documented
 // defaults (its own error says "limit: 20"). Rather than guess a fixed pace, we read
@@ -48,16 +57,220 @@ const MONGODB_URI = process.env.MONGODB_URI;
 if (!MONGODB_URI) {
   console.error('❌ MONGODB_URI environment variable is not set. Add it in Render → Environment.');
 }
+if (!JWT_SECRET) {
+  console.error('❌ JWT_SECRET is not set — login/signup will fail. Add it in Render → Environment.');
+}
+if (!process.env.EMAIL_USER || !process.env.EMAIL_PASS) {
+  console.error('⚠️ EMAIL_USER / EMAIL_PASS not set — verification and contact emails will not send.');
+}
 mongoose.connect(MONGODB_URI)
   .then(() => console.log('✅ MongoDB connected'))
   .catch(err => console.error('❌ MongoDB connection error:', err.message));
 
-app.use(cors({ origin: '*', methods: ['GET', 'POST', 'OPTIONS'], allowedHeaders: ['Content-Type'] }));
+app.use(cors({ origin: '*', methods: ['GET', 'POST', 'OPTIONS'], allowedHeaders: ['Content-Type', 'Authorization'] }));
 app.use(express.json());
+
+// ========== RATE LIMITING (protects auth + contact from abuse) ==========
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 10,                  // 10 attempts per IP per window
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { success: false, message: 'Too many attempts. Please try again in a few minutes.' }
+});
+const contactLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000, // 1 hour
+  max: 5,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { success: false, message: 'Too many messages sent. Please try again later.' }
+});
+
+// ========== AUTH MIDDLEWARE (protects routes that require login) ==========
+function requireAuth(req, res, next) {
+  const header = req.headers.authorization || '';
+  const token = header.startsWith('Bearer ') ? header.slice(7) : null;
+  if (!token) return res.status(401).json({ success: false, message: 'Not logged in' });
+  try {
+    const payload = jwt.verify(token, JWT_SECRET);
+    req.userId = payload.userId;
+    next();
+  } catch (e) {
+    return res.status(401).json({ success: false, message: 'Invalid or expired session' });
+  }
+}
 
 // ========== HEALTH CHECK ==========
 app.get('/', (req, res) => {
-  res.json({ status: 'ok', service: 'Newzyy 3-API News (MongoDB)', time: new Date().toISOString() });
+  res.json({ status: 'ok', service: 'Newzyy (Guardian + diverse RSS, MongoDB, Auth)', time: new Date().toISOString() });
+});
+
+// ════════════════════════════════════════════════════════════
+//  AUTHENTICATION
+// ════════════════════════════════════════════════════════════
+
+function isValidEmail(email) {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email || '');
+}
+function generateCode() {
+  return String(crypto.randomInt(100000, 999999)); // 6-digit code
+}
+
+// ----- SIGNUP: creates an unverified account and emails a 6-digit code -----
+app.post('/api/auth/signup', authLimiter, async (req, res) => {
+  try {
+    const { name, email, password } = req.body;
+    if (!name || !email || !password) {
+      return res.status(400).json({ success: false, message: 'Name, email, and password are required.' });
+    }
+    if (!isValidEmail(email)) {
+      return res.status(400).json({ success: false, message: 'Please enter a valid email address.' });
+    }
+    if (password.length < 6) {
+      return res.status(400).json({ success: false, message: 'Password must be at least 6 characters.' });
+    }
+
+    const existing = await User.findOne({ email: email.toLowerCase() });
+    if (existing) {
+      return res.status(409).json({ success: false, message: 'An account with this email already exists.' });
+    }
+
+    const hashedPassword = await bcrypt.hash(password, 10);
+    const code = generateCode();
+
+    const user = await User.create({
+      name: name.trim(),
+      email: email.toLowerCase().trim(),
+      password: hashedPassword,
+      verified: false,
+      verificationCode: code,
+      verificationExpires: new Date(Date.now() + VERIFICATION_CODE_TTL_MIN * 60000)
+    });
+
+    const emailSent = await sendVerificationEmail(user.email, user.name, code);
+
+    res.json({
+      success: true,
+      message: emailSent
+        ? 'Account created. Check your email for a verification code.'
+        : 'Account created, but the verification email could not be sent. Please contact support.',
+      email: user.email
+    });
+  } catch (e) {
+    console.error('signup error:', e.message);
+    res.status(500).json({ success: false, message: 'Something went wrong. Please try again.' });
+  }
+});
+
+// ----- VERIFY: confirms the 6-digit code, marks account verified, returns a login token -----
+app.post('/api/auth/verify', authLimiter, async (req, res) => {
+  try {
+    const { email, code } = req.body;
+    if (!email || !code) return res.status(400).json({ success: false, message: 'Email and code are required.' });
+
+    const user = await User.findOne({ email: email.toLowerCase() });
+    if (!user) return res.status(404).json({ success: false, message: 'No account found for this email.' });
+    if (user.verified) return res.status(400).json({ success: false, message: 'This account is already verified.' });
+
+    if (!user.verificationCode || user.verificationCode !== String(code)) {
+      return res.status(400).json({ success: false, message: 'Incorrect code.' });
+    }
+    if (!user.verificationExpires || user.verificationExpires < new Date()) {
+      return res.status(400).json({ success: false, message: 'This code has expired. Please request a new one.' });
+    }
+
+    user.verified = true;
+    user.verificationCode = null;
+    user.verificationExpires = null;
+    await user.save();
+
+    const token = jwt.sign({ userId: user._id }, JWT_SECRET, { expiresIn: '30d' });
+    res.json({ success: true, message: 'Email verified.', token, user: { name: user.name, email: user.email } });
+  } catch (e) {
+    console.error('verify error:', e.message);
+    res.status(500).json({ success: false, message: 'Something went wrong. Please try again.' });
+  }
+});
+
+// ----- RESEND CODE -----
+app.post('/api/auth/resend-code', authLimiter, async (req, res) => {
+  try {
+    const { email } = req.body;
+    if (!email) return res.status(400).json({ success: false, message: 'Email is required.' });
+
+    const user = await User.findOne({ email: email.toLowerCase() });
+    if (!user) return res.status(404).json({ success: false, message: 'No account found for this email.' });
+    if (user.verified) return res.status(400).json({ success: false, message: 'This account is already verified.' });
+
+    const code = generateCode();
+    user.verificationCode = code;
+    user.verificationExpires = new Date(Date.now() + VERIFICATION_CODE_TTL_MIN * 60000);
+    await user.save();
+
+    const emailSent = await sendVerificationEmail(user.email, user.name, code);
+    res.json({ success: true, message: emailSent ? 'A new code has been sent.' : 'Could not send email. Please try again shortly.' });
+  } catch (e) {
+    console.error('resend-code error:', e.message);
+    res.status(500).json({ success: false, message: 'Something went wrong. Please try again.' });
+  }
+});
+
+// ----- LOGIN -----
+app.post('/api/auth/login', authLimiter, async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    if (!email || !password) return res.status(400).json({ success: false, message: 'Email and password are required.' });
+
+    const user = await User.findOne({ email: email.toLowerCase() });
+    if (!user) return res.status(401).json({ success: false, message: 'Invalid email or password.' });
+
+    const match = await bcrypt.compare(password, user.password);
+    if (!match) return res.status(401).json({ success: false, message: 'Invalid email or password.' });
+
+    if (!user.verified) {
+      return res.status(403).json({ success: false, message: 'Please verify your email before logging in.', needsVerification: true, email: user.email });
+    }
+
+    const token = jwt.sign({ userId: user._id }, JWT_SECRET, { expiresIn: '30d' });
+    res.json({ success: true, token, user: { name: user.name, email: user.email } });
+  } catch (e) {
+    console.error('login error:', e.message);
+    res.status(500).json({ success: false, message: 'Something went wrong. Please try again.' });
+  }
+});
+
+// ----- CURRENT USER (requires a valid token) -----
+app.get('/api/auth/me', requireAuth, async (req, res) => {
+  try {
+    const user = await User.findById(req.userId).select('name email verified createdAt');
+    if (!user) return res.status(404).json({ success: false, message: 'User not found.' });
+    res.json({ success: true, user });
+  } catch (e) {
+    res.status(500).json({ success: false, message: 'Something went wrong.' });
+  }
+});
+
+// ════════════════════════════════════════════════════════════
+//  CONTACT FORM
+// ════════════════════════════════════════════════════════════
+app.post('/api/contact', contactLimiter, async (req, res) => {
+  try {
+    const { name, email, message } = req.body;
+    if (!name || !email || !message) {
+      return res.status(400).json({ success: false, message: 'Name, email, and message are all required.' });
+    }
+    if (!isValidEmail(email)) {
+      return res.status(400).json({ success: false, message: 'Please enter a valid email address.' });
+    }
+
+    await ContactMessage.create({ name: name.trim(), email: email.trim(), message: message.trim() });
+    sendContactNotification(name.trim(), email.trim(), message.trim()).catch(() => {}); // fire-and-forget, DB save already succeeded
+
+    res.json({ success: true, message: 'Thanks — your message has been sent.' });
+  } catch (e) {
+    console.error('contact error:', e.message);
+    res.status(500).json({ success: false, message: 'Something went wrong. Please try again.' });
+  }
 });
 
 // ========== CATEGORIES ==========
@@ -69,18 +282,21 @@ const CATEGORIES = [
 // Every category has its OWN dedicated Guardian query (never shares another
 // category's results) — either a specific section, or a free-text search when
 // no matching section exists. This is the primary source for every category.
+// FIX: ai / economy / entertainment must be `search`, not `section` — Guardian
+// "sections" are fixed single-word slugs (politics, sport, world...), not phrases
+// or boolean OR queries. Using `section` for those silently returns zero results.
 const GUARDIAN_CATEGORY_QUERY = {
   politics: { section: 'politics' },
   world: { section: 'world' },
   technology: { section: 'technology' },
-  ai: { section: 'artificial intelligence' },
+  ai: { search: 'artificial intelligence' },
   business: { section: 'business' },
-  economy: { section: 'economy OR economic OR inflation OR "interest rates"' },
+  economy: { search: 'economy OR economic OR inflation OR "interest rates"' },
   health: { section: 'health' },
   science: { section: 'science' },
   environment: { section: 'environment' },
   sports: { section: 'sport' },
-  entertainment: { section: 'entertainment OR celebrity OR film OR music OR television' },
+  entertainment: { search: 'entertainment OR celebrity OR film OR music OR television' },
   culture: { section: 'culture' },
   travel: { section: 'travel' }
 };
@@ -425,9 +641,9 @@ async function isGoodImage(url) {
 }
 
 // ========== GEMINI REWRITE ==========
-// Takes the raw facts from the 3 news APIs and asks Gemini to write an
-// original Newzyy article from them. Returns null on any failure so the
-// caller can fall back to the original excerpt (never breaks the pipeline).
+// Takes the raw facts from the source APIs and asks Gemini to write an
+// original Newzyy article from them. Returns null text on any failure so the
+// caller can skip publishing (never breaks the pipeline).
 async function rewriteWithGemini(rawArticle, category) {
   if (!GEMINI_API_KEY) return { text: null, retryAfterMs: 0 };
 
@@ -491,9 +707,9 @@ function checkGeminiDayReset() {
   }
 }
 
-// ========== MAIN FETCH FUNCTION (now writes to MongoDB, round-robin across categories) ==========
+// ========== MAIN FETCH FUNCTION (MongoDB, fair round-robin across all categories) ==========
 async function fetchAllNews() {
-  console.log(`\n🔄 [${new Date().toLocaleTimeString()}] Starting news fetch (Guardian + RSS, per category)...`);
+  console.log(`\n🔄 [${new Date().toLocaleTimeString()}] Starting news fetch (Guardian + diverse RSS, per category)...`);
   checkGeminiDayReset();
 
   // Load existing titles once, so we don't hit the DB per-article inside the loop.
@@ -518,10 +734,8 @@ async function fetchAllNews() {
   }
 
   // ----- Step 2: round-robin through categories one article at a time -----
-  // This is the key fairness fix: instead of exhausting the Gemini budget on
-  // whichever category happens to run first, every category gets a turn before
-  // any category gets a second turn. If the budget runs out mid-way, every
-  // category has already had a roughly equal share, not just the first few.
+  // Every category gets a turn before any category gets a second turn, so if
+  // the Gemini budget runs out mid-cycle, every category already had a fair share.
   const stats = {};
   CATEGORIES.forEach(c => (stats[c] = { added: 0, skippedImage: 0, skippedGemini: 0 }));
 
@@ -667,7 +881,7 @@ app.get('/manual-fetch', async (req, res) => {
 
 // ========== START SCHEDULE ==========
 mongoose.connection.once('open', () => {
-  console.log('📰 Initializing news fetcher (Guardian + RSS, dedicated per category, Gemini rewrite)...');
+  console.log('📰 Initializing news fetcher (Guardian + diverse RSS, dedicated per category, Gemini rewrite)...');
   fetchAllNews().catch(console.error);
 
   setInterval(async () => {
@@ -679,7 +893,7 @@ mongoose.connection.once('open', () => {
 // ========== START SERVER ==========
 app.listen(PORT, () => {
   console.log(`\n🚀 Server running on port ${PORT}`);
-  console.log(`   🔥 Guardian + RSS per category, Gemini-rewritten, MongoDB storage`);
+  console.log(`   🔥 Guardian + diverse RSS per category, Gemini-rewritten, MongoDB storage`);
   console.log(`   GET  /api/all-news?page=1&limit=20&category=technology`);
   console.log(`   GET  /api/article/:id`);
   console.log(`   GET  /api/category/:slug`);
@@ -689,5 +903,8 @@ app.listen(PORT, () => {
   console.log(`   GET  /sitemap.xml`);
   console.log(`   GET  /rss.xml`);
   console.log(`   GET  /manual-fetch`);
+  console.log(`   POST /api/auth/signup | /api/auth/verify | /api/auth/resend-code | /api/auth/login`);
+  console.log(`   GET  /api/auth/me  (requires Authorization: Bearer <token>)`);
+  console.log(`   POST /api/contact`);
   console.log(`   Auto fetch every 6 hours | Auto-delete articles older than 90 days\n`);
 });
