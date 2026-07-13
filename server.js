@@ -147,13 +147,14 @@ app.post('/api/auth/signup', authLimiter, async (req, res) => {
       verificationExpires: new Date(Date.now() + VERIFICATION_CODE_TTL_MIN * 60000)
     });
 
-    const emailSent = await sendVerificationEmail(user.email, user.name, code);
+    // Fire-and-forget: never let a slow/blocked mailer hold up this response.
+    sendVerificationEmail(user.email, user.name, code)
+      .then(sent => { if (!sent) console.error(`   ⚠️ Verification email did not send for ${user.email}`); })
+      .catch(err => console.error('   ⚠️ Verification email error:', err.message));
 
     res.json({
       success: true,
-      message: emailSent
-        ? 'Account created. Check your email for a verification code.'
-        : 'Account created, but the verification email could not be sent. Please contact support.',
+      message: 'Account created. Check your email for a verification code — it may take a minute to arrive.',
       email: user.email
     });
   } catch (e) {
@@ -207,8 +208,11 @@ app.post('/api/auth/resend-code', authLimiter, async (req, res) => {
     user.verificationExpires = new Date(Date.now() + VERIFICATION_CODE_TTL_MIN * 60000);
     await user.save();
 
-    const emailSent = await sendVerificationEmail(user.email, user.name, code);
-    res.json({ success: true, message: emailSent ? 'A new code has been sent.' : 'Could not send email. Please try again shortly.' });
+    sendVerificationEmail(user.email, user.name, code)
+      .then(sent => { if (!sent) console.error(`   ⚠️ Resend verification email did not send for ${user.email}`); })
+      .catch(err => console.error('   ⚠️ Resend verification email error:', err.message));
+
+    res.json({ success: true, message: 'A new code is on its way — it may take a minute to arrive.' });
   } catch (e) {
     console.error('resend-code error:', e.message);
     res.status(500).json({ success: false, message: 'Something went wrong. Please try again.' });
@@ -862,6 +866,24 @@ app.get('/admin/purge-all', async (req, res) => {
   try {
     const result = await Article.deleteMany({});
     res.json({ success: true, deleted: result.deletedCount, message: 'ALL articles removed.' });
+  } catch (e) {
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
+// Visit in browser: /admin/check-verification?email=user@example.com&secret=YOUR_SECRET
+// Temporary safety net while confirming email deliverability — lets you see a user's
+// current pending code without needing the email to arrive. Remove/ignore once email
+// sending is confirmed reliable.
+app.get('/admin/check-verification', async (req, res) => {
+  if (!ADMIN_SECRET) return res.status(500).json({ success: false, message: 'ADMIN_SECRET not set on server' });
+  if (req.query.secret !== ADMIN_SECRET) return res.status(403).json({ success: false, message: 'Wrong secret' });
+
+  try {
+    const user = await User.findOne({ email: (req.query.email || '').toLowerCase() })
+      .select('name email verified verificationCode verificationExpires');
+    if (!user) return res.status(404).json({ success: false, message: 'No account found for this email.' });
+    res.json({ success: true, user });
   } catch (e) {
     res.status(500).json({ success: false, message: e.message });
   }
