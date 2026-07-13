@@ -13,7 +13,10 @@ let transporter = null;
 if (EMAIL_USER && EMAIL_PASS) {
   transporter = nodemailer.createTransport({
     service: 'gmail',
-    auth: { user: EMAIL_USER, pass: EMAIL_PASS }
+    auth: { user: EMAIL_USER, pass: EMAIL_PASS },
+    connectionTimeout: 10000, // fail fast instead of hanging if the port is blocked
+    greetingTimeout: 10000,
+    socketTimeout: 10000
   });
 } else {
   console.error('⚠️ EMAIL_USER / EMAIL_PASS not set — emails will not be sent. Add them in Render → Environment.');
