@@ -16,7 +16,8 @@ const crypto = require('crypto');
 const Article = require('./models/article.js');
 const User = require('./models/User');
 const ContactMessage = require('./models/ContactMessage');
-const { sendVerificationEmail, sendContactNotification } = require('./utils/mailer'); // FIX: was './models/article.js' (lowercase) — Render
+const Subscriber = require('./models/Subscriber');
+const { sendVerificationEmail, sendContactNotification, sendNewsletterDigest } = require('./utils/mailer'); // FIX: was './models/article.js' (lowercase) — Render
                                               // is case-sensitive (Linux); the real file is Article.js.
                                               // This exact mismatch crashes the whole server on deploy.
 
@@ -274,6 +275,179 @@ app.post('/api/contact', contactLimiter, async (req, res) => {
   } catch (e) {
     console.error('contact error:', e.message);
     res.status(500).json({ success: false, message: 'Something went wrong. Please try again.' });
+  }
+});
+
+// ════════════════════════════════════════════════════════════
+//  BOOKMARKS (requires login)
+// ════════════════════════════════════════════════════════════
+
+app.get('/api/bookmarks', requireAuth, async (req, res) => {
+  try {
+    const user = await User.findById(req.userId).select('bookmarks');
+    if (!user) return res.status(404).json({ success: false, message: 'User not found.' });
+
+    const articles = await Article.find({ id: { $in: user.bookmarks }, status: 'published' }).lean();
+    res.json({ success: true, news: attachLiveFields(articles) });
+  } catch (e) {
+    console.error('bookmarks list error:', e.message);
+    res.status(500).json({ success: false, message: 'Something went wrong.' });
+  }
+});
+
+app.post('/api/bookmarks/:articleId', requireAuth, async (req, res) => {
+  try {
+    const article = await Article.findOne({ id: req.params.articleId });
+    if (!article) return res.status(404).json({ success: false, message: 'Article not found.' });
+
+    await User.updateOne({ _id: req.userId }, { $addToSet: { bookmarks: req.params.articleId } });
+    res.json({ success: true, message: 'Saved.' });
+  } catch (e) {
+    console.error('bookmark add error:', e.message);
+    res.status(500).json({ success: false, message: 'Something went wrong.' });
+  }
+});
+
+app.delete('/api/bookmarks/:articleId', requireAuth, async (req, res) => {
+  try {
+    await User.updateOne({ _id: req.userId }, { $pull: { bookmarks: req.params.articleId } });
+    res.json({ success: true, message: 'Removed.' });
+  } catch (e) {
+    console.error('bookmark remove error:', e.message);
+    res.status(500).json({ success: false, message: 'Something went wrong.' });
+  }
+});
+
+// ════════════════════════════════════════════════════════════
+//  NEWSLETTER
+// ════════════════════════════════════════════════════════════
+
+app.post('/api/newsletter/subscribe', contactLimiter, async (req, res) => {
+  try {
+    const { email } = req.body;
+    if (!email || !isValidEmail(email)) {
+      return res.status(400).json({ success: false, message: 'Please enter a valid email address.' });
+    }
+    const existing = await Subscriber.findOne({ email: email.toLowerCase() });
+    if (existing) {
+      if (existing.active) return res.json({ success: true, message: "You're already subscribed." });
+      existing.active = true;
+      await existing.save();
+      return res.json({ success: true, message: 'Welcome back — you\'re re-subscribed.' });
+    }
+    await Subscriber.create({ email: email.toLowerCase().trim() });
+    res.json({ success: true, message: 'Subscribed! Look out for our next digest.' });
+  } catch (e) {
+    console.error('newsletter subscribe error:', e.message);
+    res.status(500).json({ success: false, message: 'Something went wrong. Please try again.' });
+  }
+});
+
+app.post('/api/newsletter/unsubscribe', async (req, res) => {
+  try {
+    const { email } = req.body;
+    if (!email) return res.status(400).json({ success: false, message: 'Email is required.' });
+    await Subscriber.updateOne({ email: email.toLowerCase() }, { active: false });
+    res.json({ success: true, message: 'You have been unsubscribed.' });
+  } catch (e) {
+    res.status(500).json({ success: false, message: 'Something went wrong.' });
+  }
+});
+
+// Sends today's top 5 articles (by views) to every active subscriber.
+// Runs automatically once a day (see schedule below) — can also be triggered
+// manually via /admin/send-newsletter-now for testing.
+async function sendDailyDigest() {
+  console.log('\n📧 Sending newsletter digest...');
+  try {
+    const topArticles = await Article.find({ status: 'published' }).sort({ views: -1 }).limit(5).lean();
+    if (!topArticles.length) { console.log('   No articles to send.'); return; }
+
+    const articlesForEmail = topArticles.map(a => ({
+      title: a.title,
+      category: CATEGORY_NAMES_BACKEND[a.category] || a.category,
+      excerpt: a.excerpt,
+      url: `${SITE_URL}/single-post.html?id=${a.id}`
+    }));
+
+    const subscribers = await Subscriber.find({ active: true }).lean();
+    let sent = 0;
+    for (const sub of subscribers) {
+      const ok = await sendNewsletterDigest(sub.email, articlesForEmail);
+      if (ok) {
+        sent++;
+        await Subscriber.updateOne({ _id: sub._id }, { lastSentAt: new Date() });
+      }
+      await new Promise(r => setTimeout(r, 300)); // gentle pacing, stay well under Resend's free-tier rate
+    }
+    console.log(`   ✅ Digest sent to ${sent}/${subscribers.length} subscribers`);
+  } catch (e) {
+    console.error('   ⚠️ Digest error:', e.message);
+  }
+}
+const CATEGORY_NAMES_BACKEND = {
+  politics: 'Politics', technology: 'Technology', ai: 'AI', sports: 'Sports', business: 'Business',
+  health: 'Health', science: 'Science', entertainment: 'Entertainment', travel: 'Travel',
+  environment: 'Earth', culture: 'Culture', world: 'World', economy: 'Economy'
+};
+
+app.get('/admin/send-newsletter-now', async (req, res) => {
+  if (!ADMIN_SECRET) return res.status(500).json({ success: false, message: 'ADMIN_SECRET not set on server' });
+  if (req.query.secret !== ADMIN_SECRET) return res.status(403).json({ success: false, message: 'Wrong secret' });
+  sendDailyDigest();
+  res.json({ success: true, message: 'Digest send started — check logs for progress.' });
+});
+
+// ════════════════════════════════════════════════════════════
+//  ADMIN DASHBOARD DATA (read-only, secret-protected)
+// ════════════════════════════════════════════════════════════
+
+app.get('/api/admin/contacts', async (req, res) => {
+  if (!ADMIN_SECRET) return res.status(500).json({ success: false, message: 'ADMIN_SECRET not set on server' });
+  if (req.query.secret !== ADMIN_SECRET) return res.status(403).json({ success: false, message: 'Wrong secret' });
+  try {
+    const messages = await ContactMessage.find().sort({ createdAt: -1 }).limit(200).lean();
+    res.json({ success: true, messages });
+  } catch (e) {
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
+app.get('/api/admin/users', async (req, res) => {
+  if (!ADMIN_SECRET) return res.status(500).json({ success: false, message: 'ADMIN_SECRET not set on server' });
+  if (req.query.secret !== ADMIN_SECRET) return res.status(403).json({ success: false, message: 'Wrong secret' });
+  try {
+    const users = await User.find().select('name email verified createdAt bookmarks').sort({ createdAt: -1 }).limit(300).lean();
+    res.json({ success: true, users });
+  } catch (e) {
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
+app.get('/api/admin/subscribers', async (req, res) => {
+  if (!ADMIN_SECRET) return res.status(500).json({ success: false, message: 'ADMIN_SECRET not set on server' });
+  if (req.query.secret !== ADMIN_SECRET) return res.status(403).json({ success: false, message: 'Wrong secret' });
+  try {
+    const subscribers = await Subscriber.find().sort({ subscribedAt: -1 }).limit(500).lean();
+    res.json({ success: true, subscribers });
+  } catch (e) {
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
+app.get('/api/admin/stats', async (req, res) => {
+  if (!ADMIN_SECRET) return res.status(500).json({ success: false, message: 'ADMIN_SECRET not set on server' });
+  if (req.query.secret !== ADMIN_SECRET) return res.status(403).json({ success: false, message: 'Wrong secret' });
+  try {
+    const [articleCount, userCount, subscriberCount, contactCount] = await Promise.all([
+      Article.countDocuments({ status: 'published' }),
+      User.countDocuments(),
+      Subscriber.countDocuments({ active: true }),
+      ContactMessage.countDocuments()
+    ]);
+    res.json({ success: true, stats: { articleCount, userCount, subscriberCount, contactCount } });
+  } catch (e) {
+    res.status(500).json({ success: false, message: e.message });
   }
 });
 
@@ -910,6 +1084,11 @@ mongoose.connection.once('open', () => {
     console.log('⏰ Scheduled news fetch...');
     await fetchAllNews().catch(console.error);
   }, 6 * 60 * 60 * 1000);
+
+  // Newsletter digest — once every 24 hours.
+  setInterval(async () => {
+    await sendDailyDigest().catch(console.error);
+  }, 24 * 60 * 60 * 1000);
 });
 
 // ========== START SERVER ==========
@@ -928,5 +1107,8 @@ app.listen(PORT, () => {
   console.log(`   POST /api/auth/signup | /api/auth/verify | /api/auth/resend-code | /api/auth/login`);
   console.log(`   GET  /api/auth/me  (requires Authorization: Bearer <token>)`);
   console.log(`   POST /api/contact`);
+  console.log(`   GET/POST/DELETE /api/bookmarks (requires login)`);
+  console.log(`   POST /api/newsletter/subscribe | /unsubscribe`);
+  console.log(`   GET  /api/admin/contacts | /users | /subscribers | /stats (secret-protected)`);
   console.log(`   Auto fetch every 6 hours | Auto-delete articles older than 90 days\n`);
 });
