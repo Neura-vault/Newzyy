@@ -13,6 +13,8 @@ const userSchema = new mongoose.Schema({
   verificationCode: { type: String, default: null },      // 6-digit code, cleared once used
   verificationExpires: { type: Date, default: null },     // code valid for 15 minutes
 
+  bookmarks: { type: [String], default: [] }, // article ids saved by this user
+
   createdAt: { type: Date, default: Date.now }
 });
 
