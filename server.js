@@ -485,17 +485,17 @@ const GUARDIAN_CATEGORY_QUERY = {
 const RSS_FEEDS = {
   politics: 'https://feeds.bbci.co.uk/news/politics/rss.xml',
   world: 'https://feeds.bbci.co.uk/news/world/rss.xml',
-  technology: 'https://techcrunch.com/feed/',
-  ai: 'https://www.technologyreview.com/topic/artificial-intelligence/feed/',
+  technology: 'https://feeds.bbci.co.uk/news/technology/rss.xml',
+  ai: 'https://openai.com/news/rss.xml',
   business: 'https://feeds.bbci.co.uk/news/business/rss.xml',
-  economy: 'https://news.google.com/rss/search?q=economy&hl=en-US&gl=US&ceid=US:en',
+  economy: 'https://www.cnbc.com/id/20910258/device/rss/rss.html',
   health: 'https://feeds.bbci.co.uk/news/health/rss.xml',
   science: 'https://feeds.bbci.co.uk/news/science_and_environment/rss.xml',
-  environment: 'https://news.mongabay.com/feed/',
+  environment: 'https://www.theguardian.com/environment/rss',
   sports: 'https://feeds.bbci.co.uk/sport/rss.xml',
   entertainment: 'https://feeds.bbci.co.uk/news/entertainment_and_arts/rss.xml',
-  culture: 'https://www.smithsonianmag.com/rss/arts-culture/',
-  travel: 'https://www.cntraveler.com/feed/rss',
+  culture: 'https://www.theguardian.com/culture/rss',
+  travel: 'https://www.theguardian.com/uk/travel/rss',
 };
 
 // Time string is now computed live at READ time, never stored — so it never goes stale.
