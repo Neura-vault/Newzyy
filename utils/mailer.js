@@ -95,4 +95,25 @@ async function sendContactNotification(name, fromEmail, message) {
   );
 }
 
-module.exports = { sendVerificationEmail, sendContactNotification };
+async function sendNewsletterDigest(toEmail, articles) {
+  const itemsHtml = articles.map(a => `
+    <div style="margin-bottom:18px;padding-bottom:18px;border-bottom:1px solid #e3ded3;">
+      <div style="font-size:0.65rem;font-weight:800;text-transform:uppercase;color:#b80000;">${a.category}</div>
+      <div style="font-size:1rem;font-weight:700;margin:4px 0;">${a.title}</div>
+      <div style="font-size:0.85rem;color:#666;">${(a.excerpt || '').substring(0, 120)}...</div>
+      <a href="${a.url}" style="font-size:0.8rem;color:#b80000;font-weight:600;">Read more →</a>
+    </div>
+  `).join('');
+
+  return sendEmail(
+    toEmail,
+    `Today's top stories from Newzyy`,
+    wrapEmail("Today's Top Stories", itemsHtml + `
+      <p style="font-size:0.75rem;color:#999;margin-top:10px;">
+        You're receiving this because you subscribed at newzyy.site.
+      </p>
+    `)
+  );
+}
+
+module.exports = { sendVerificationEmail, sendContactNotification, sendNewsletterDigest };
