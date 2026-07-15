@@ -2,9 +2,9 @@
 //  ARTICLE MODEL — MongoDB schema
 //  Ye file naye "models" folder mein rakhni hai backend repo ke andar
 // ════════════════════════════════════════════════════════════
- 
+
 const mongoose = require('mongoose');
- 
+
 const articleSchema = new mongoose.Schema({
   id: { type: String, required: true, unique: true, index: true },
   category: { type: String, index: true },
@@ -19,10 +19,11 @@ const articleSchema = new mongoose.Schema({
   source_url: String,
   source: String,
   rewritten: { type: Boolean, default: false }, // true = body was rewritten by Gemini, not copied
+  manualBreaking: { type: Boolean, default: false }, // admin override — force-shows the Live/Breaking badge
   fetched_at: { type: Date, default: Date.now, index: true }
 });
- 
+
 // Same title dobara save na ho isliye index
 articleSchema.index({ title: 1 });
- 
+
 module.exports = mongoose.model('Article', articleSchema);
