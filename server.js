@@ -13,7 +13,7 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const rateLimit = require('express-rate-limit');
 const crypto = require('crypto');
-const Article = require('./models/article.js');
+const Article = require('./models/article');
 const User = require('./models/User');
 const ContactMessage = require('./models/ContactMessage');
 const Subscriber = require('./models/Subscriber');
@@ -335,13 +335,31 @@ app.post('/api/newsletter/subscribe', contactLimiter, async (req, res) => {
       await existing.save();
       return res.json({ success: true, message: 'Welcome back — you\'re re-subscribed.' });
     }
-    await Subscriber.create({ email: email.toLowerCase().trim() });
-    res.json({ success: true, message: 'Subscribed! Look out for our next digest.' });
+    const sub = await Subscriber.create({ email: email.toLowerCase().trim() });
+
+    // Send an immediate welcome digest so new subscribers see something right away,
+    // instead of waiting for the next scheduled 24-hour cycle.
+    sendWelcomeDigest(sub.email).catch(err => console.error('   ⚠️ Welcome digest error:', err.message));
+
+    res.json({ success: true, message: 'Subscribed! Check your inbox for today\'s top stories.' });
   } catch (e) {
     console.error('newsletter subscribe error:', e.message);
     res.status(500).json({ success: false, message: 'Something went wrong. Please try again.' });
   }
 });
+
+async function sendWelcomeDigest(email) {
+  const topArticles = await Article.find({ status: 'published' }).sort({ views: -1 }).limit(5).lean();
+  if (!topArticles.length) return;
+  const articlesForEmail = topArticles.map(a => ({
+    title: a.title,
+    category: CATEGORY_NAMES_BACKEND[a.category] || a.category,
+    excerpt: a.excerpt,
+    url: `${SITE_URL}/single-post.html?id=${a.id}`
+  }));
+  const ok = await sendNewsletterDigest(email, articlesForEmail);
+  if (ok) await Subscriber.updateOne({ email }, { lastSentAt: new Date() });
+}
 
 app.post('/api/newsletter/unsubscribe', async (req, res) => {
   try {
@@ -445,7 +463,88 @@ app.get('/api/admin/stats', async (req, res) => {
       Subscriber.countDocuments({ active: true }),
       ContactMessage.countDocuments()
     ]);
-    res.json({ success: true, stats: { articleCount, userCount, subscriberCount, contactCount } });
+    const perCategory = await Article.aggregate([
+      { $match: { status: 'published' } },
+      { $group: { _id: '$category', count: { $sum: 1 } } }
+    ]);
+    res.json({
+      success: true,
+      stats: { articleCount, userCount, subscriberCount, contactCount },
+      perCategory,
+      gemini: { callsToday: geminiCallsToday, maxPerDay: GEMINI_MAX_PER_DAY }
+    });
+  } catch (e) {
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
+// ----- Articles: list + delete -----
+app.get('/api/admin/articles', async (req, res) => {
+  if (!ADMIN_SECRET) return res.status(500).json({ success: false, message: 'ADMIN_SECRET not set on server' });
+  if (req.query.secret !== ADMIN_SECRET) return res.status(403).json({ success: false, message: 'Wrong secret' });
+  try {
+    const articles = await Article.find().sort({ fetched_at: -1 }).limit(100).lean();
+    res.json({ success: true, articles: attachLiveFields(articles) });
+  } catch (e) {
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
+app.delete('/api/admin/article/:id', async (req, res) => {
+  if (!ADMIN_SECRET) return res.status(500).json({ success: false, message: 'ADMIN_SECRET not set on server' });
+  if (req.query.secret !== ADMIN_SECRET) return res.status(403).json({ success: false, message: 'Wrong secret' });
+  try {
+    await Article.deleteOne({ id: req.params.id });
+    res.json({ success: true, message: 'Article deleted.' });
+  } catch (e) {
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
+app.patch('/api/admin/article/:id/toggle-breaking', async (req, res) => {
+  if (!ADMIN_SECRET) return res.status(500).json({ success: false, message: 'ADMIN_SECRET not set on server' });
+  if (req.query.secret !== ADMIN_SECRET) return res.status(403).json({ success: false, message: 'Wrong secret' });
+  try {
+    const article = await Article.findOne({ id: req.params.id });
+    if (!article) return res.status(404).json({ success: false, message: 'Not found.' });
+    article.manualBreaking = !article.manualBreaking;
+    await article.save();
+    res.json({ success: true, manualBreaking: article.manualBreaking });
+  } catch (e) {
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
+// ----- Contact messages: mark read + delete -----
+app.patch('/api/admin/contact/:id/read', async (req, res) => {
+  if (!ADMIN_SECRET) return res.status(500).json({ success: false, message: 'ADMIN_SECRET not set on server' });
+  if (req.query.secret !== ADMIN_SECRET) return res.status(403).json({ success: false, message: 'Wrong secret' });
+  try {
+    await ContactMessage.updateOne({ _id: req.params.id }, { read: true });
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
+app.delete('/api/admin/contact/:id', async (req, res) => {
+  if (!ADMIN_SECRET) return res.status(500).json({ success: false, message: 'ADMIN_SECRET not set on server' });
+  if (req.query.secret !== ADMIN_SECRET) return res.status(403).json({ success: false, message: 'Wrong secret' });
+  try {
+    await ContactMessage.deleteOne({ _id: req.params.id });
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
+// ----- Users: delete -----
+app.delete('/api/admin/user/:id', async (req, res) => {
+  if (!ADMIN_SECRET) return res.status(500).json({ success: false, message: 'ADMIN_SECRET not set on server' });
+  if (req.query.secret !== ADMIN_SECRET) return res.status(403).json({ success: false, message: 'Wrong secret' });
+  try {
+    await User.deleteOne({ _id: req.params.id });
+    res.json({ success: true });
   } catch (e) {
     res.status(500).json({ success: false, message: e.message });
   }
@@ -526,7 +625,7 @@ function attachLiveFields(articles) {
     return {
       ...a,
       time: formatTimeAgo(a.fetched_at),
-      breaking: Boolean(isNewestInCategory && ageMins < 60)
+      breaking: Boolean(a.manualBreaking || (isNewestInCategory && ageMins < 60))
     };
   });
 }
@@ -715,23 +814,42 @@ async function fetchGuardianForCategory(cat) {
   const base = q.section
     ? `section=${encodeURIComponent(q.section)}`
     : `q=${encodeURIComponent(q.search)}`;
-  const url = `https://content.guardianapis.com/search?${base}&api-key=${GUARDIAN_API_KEY}&show-fields=body,thumbnail,trailText&page-size=15&order-by=newest`;
+  const url = `https://content.guardianapis.com/search?${base}&api-key=${GUARDIAN_API_KEY}&show-fields=body,thumbnail,trailText&show-elements=image&page-size=15&order-by=newest`;
 
   try {
     const response = await fetch(url);
     const data = await response.json();
     if (!data.response || !data.response.results) return [];
 
-    return data.response.results.map(a => ({
-      title: a.webTitle || a.fields?.headline || 'Untitled',
-      description: stripHtml(a.fields?.trailText || ''),
-      body: stripHtml(a.fields?.body || ''),
-      url: a.webUrl || a.url,
-      image: a.fields?.thumbnail || '',
-      author: a.fields?.byline || a.sectionName || 'The Guardian',
-      publishedAt: a.webPublicationDate || new Date().toISOString(),
-      source: 'The Guardian'
-    }));
+    return data.response.results.map(a => {
+      // Guardian's fields.thumbnail is a tiny ~140x84 crop — too small to display well.
+      // The `elements` array (from show-elements=image) carries the real, full-size
+      // picture with multiple asset sizes. Pick the largest available one instead.
+      let image = a.fields?.thumbnail || '';
+      try {
+        const imageElement = (a.elements || []).find(el => el.type === 'image');
+        const assets = imageElement?.assets || [];
+        if (assets.length) {
+          const largest = assets.reduce((best, cur) => {
+            const w = parseInt(cur.typeData?.width) || 0;
+            const bw = parseInt(best?.typeData?.width) || 0;
+            return w > bw ? cur : best;
+          }, assets[0]);
+          if (largest?.file) image = largest.file;
+        }
+      } catch (e) { /* fall back to thumbnail — never fatal */ }
+
+      return {
+        title: a.webTitle || a.fields?.headline || 'Untitled',
+        description: stripHtml(a.fields?.trailText || ''),
+        body: stripHtml(a.fields?.body || ''),
+        url: a.webUrl || a.url,
+        image,
+        author: a.fields?.byline || a.sectionName || 'The Guardian',
+        publishedAt: a.webPublicationDate || new Date().toISOString(),
+        source: 'The Guardian'
+      };
+    });
   } catch (e) {
     console.error(`   ⚠️ Guardian fetch failed for ${cat}:`, e.message);
     return []; // never throw — an empty array just means this source contributed nothing this cycle
@@ -789,9 +907,9 @@ async function fetchCategorySources(cat) {
 // small to look sharp at our display sizes (a cheap, reliable stand-in for true
 // blur detection — low-res images stretched to fill a 170-360px card are the
 // ones that look "blurry" in practice).
-const MIN_IMAGE_WIDTH = 400;
-const MIN_IMAGE_HEIGHT = 250;
-const MIN_IMAGE_BYTES = 8000; // filters out tiny placeholder/broken-icon images
+const MIN_IMAGE_WIDTH = 300;
+const MIN_IMAGE_HEIGHT = 180;
+const MIN_IMAGE_BYTES = 4000; // filters out tiny placeholder/broken-icon images
 
 async function isGoodImage(url) {
   if (!url) return false;
