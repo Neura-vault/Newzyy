@@ -13,7 +13,7 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const rateLimit = require('express-rate-limit');
 const crypto = require('crypto');
-const Article = require('./models/article');
+const Article = require('./models/article.js');
 const User = require('./models/User');
 const ContactMessage = require('./models/ContactMessage');
 const Subscriber = require('./models/Subscriber');
@@ -53,6 +53,15 @@ const GEMINI_MAX_ROUNDS_PER_CYCLE = 20;    // cap how many articles per category
 let geminiCallsToday = 0;
 let geminiDayStamp = new Date().toDateString();
 
+// ----- Groq: second AI provider (separate free account, separate quota) -----
+// Used as a fallback when Gemini's quota runs out — genuinely combines both
+// companies' free tiers rather than trying to bypass either one's limits.
+const GROQ_API_KEY = process.env.GROQ_API_KEY;
+const GROQ_MODEL = 'llama-3.1-8b-instant'; // most generous free-tier limits on Groq
+const GROQ_MAX_PER_DAY = 12000;            // safety margin under Groq's ~14,400/day
+let groqCallsToday = 0;
+let groqDayStamp = new Date().toDateString();
+
 // ========== MONGODB CONNECTION ==========
 const MONGODB_URI = process.env.MONGODB_URI;
 if (!MONGODB_URI) {
@@ -68,7 +77,7 @@ mongoose.connect(MONGODB_URI)
   .then(() => console.log('✅ MongoDB connected'))
   .catch(err => console.error('❌ MongoDB connection error:', err.message));
 
-app.use(cors({ origin: '*', methods: ['GET', 'POST', 'OPTIONS'], allowedHeaders: ['Content-Type', 'Authorization'] }));
+app.use(cors({ origin: '*', methods: ['GET', 'POST', 'DELETE', 'PATCH', 'PUT', 'OPTIONS'], allowedHeaders: ['Content-Type', 'Authorization'] }));
 app.use(express.json());
 
 // ========== RATE LIMITING (protects auth + contact from abuse) ==========
@@ -471,7 +480,8 @@ app.get('/api/admin/stats', async (req, res) => {
       success: true,
       stats: { articleCount, userCount, subscriberCount, contactCount },
       perCategory,
-      gemini: { callsToday: geminiCallsToday, maxPerDay: GEMINI_MAX_PER_DAY }
+      gemini: { callsToday: geminiCallsToday, maxPerDay: GEMINI_MAX_PER_DAY },
+      groq: { configured: Boolean(GROQ_API_KEY), callsToday: groqCallsToday, maxPerDay: GROQ_MAX_PER_DAY }
     });
   } catch (e) {
     res.status(500).json({ success: false, message: e.message });
@@ -585,7 +595,7 @@ const RSS_FEEDS = {
   politics: 'https://feeds.bbci.co.uk/news/politics/rss.xml',
   world: 'https://feeds.bbci.co.uk/news/world/rss.xml',
   technology: 'https://feeds.bbci.co.uk/news/technology/rss.xml',
-  ai: 'https://openai.com/news/rss.xml',
+  ai: 'https://techcrunch.com/category/artificial-intelligence/feed/',
   business: 'https://feeds.bbci.co.uk/news/business/rss.xml',
   economy: 'https://www.cnbc.com/id/20910258/device/rss/rss.html',
   health: 'https://feeds.bbci.co.uk/news/health/rss.xml',
@@ -1002,6 +1012,83 @@ function checkGeminiDayReset() {
     geminiCallsToday = 0;
   }
 }
+function checkGroqDayReset() {
+  const today = new Date().toDateString();
+  if (today !== groqDayStamp) {
+    groqDayStamp = today;
+    groqCallsToday = 0;
+  }
+}
+
+// ========== GROQ REWRITE (fallback provider) ==========
+async function rewriteWithGroq(rawArticle, category) {
+  if (!GROQ_API_KEY) return { text: null, retryAfterMs: 0 };
+
+  const sourceFacts = (rawArticle.body || rawArticle.description || '').substring(0, 3000);
+  if (!sourceFacts.trim()) return { text: null, retryAfterMs: 0 };
+
+  const prompt = `You are a staff news writer for "Newzyy", an independent news outlet.
+Using ONLY the facts below, write an original news article in your own words — do not copy sentences or phrasing from the source text.
+If the source facts are limited, write a shorter article rather than inventing extra details, numbers, quotes, or names that aren't in the source.
+Length: 150-400 words depending on how much source material is available. Tone: clear, neutral, professional news style.
+Output ONLY the article body text. No headline, no preamble, no markdown.
+
+Headline: ${rawArticle.title}
+Category: ${category}
+Source facts:
+${sourceFacts}`;
+
+  try {
+    const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${GROQ_API_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: GROQ_MODEL,
+        messages: [{ role: 'user', content: prompt }]
+      })
+    });
+    const data = await res.json();
+
+    if (!res.ok || data.error) {
+      console.error(`   ⚠️ Groq API error [${res.status}]:`, data.error?.message || JSON.stringify(data).substring(0, 300));
+      // Groq sends a Retry-After header on 429s — honor it if present.
+      const retryAfter = res.headers.get('retry-after');
+      const retryAfterMs = retryAfter ? Math.min(parseInt(retryAfter) * 1000, 70000) : 0;
+      return { text: null, retryAfterMs };
+    }
+
+    const text = data?.choices?.[0]?.message?.content;
+    if (!text) return { text: null, retryAfterMs: 0 };
+    return { text: text.trim().length > 80 ? text.trim() : null, retryAfterMs: 0 };
+  } catch (e) {
+    console.error('   ⚠️ Groq rewrite error:', e.message);
+    return { text: null, retryAfterMs: 0 };
+  }
+}
+
+// ========== COMBINED REWRITE: Gemini first, Groq as fallback ==========
+// Genuinely combines two separate companies' free quotas — not multiple
+// accounts on the same service, which would risk violating either ToS.
+async function rewriteArticle(rawArticle, category) {
+  checkGeminiDayReset();
+  checkGroqDayReset();
+
+  if (GEMINI_API_KEY && geminiCallsToday < GEMINI_MAX_PER_DAY) {
+    const result = await rewriteWithGemini(rawArticle, category);
+    geminiCallsToday++;
+    if (result.text) return { ...result, provider: 'gemini' };
+    // Gemini failed (quota/error) — fall through to Groq below.
+  }
+
+  if (GROQ_API_KEY && groqCallsToday < GROQ_MAX_PER_DAY) {
+    const result = await rewriteWithGroq(rawArticle, category);
+    groqCallsToday++;
+    if (result.text) return { ...result, provider: 'groq' };
+    return { ...result, provider: 'groq' };
+  }
+
+  return { text: null, retryAfterMs: 0, provider: 'none' };
+}
 
 // ========== MAIN FETCH FUNCTION (MongoDB, fair round-robin across all categories) ==========
 async function fetchAllNews() {
@@ -1057,24 +1144,21 @@ async function fetchAllNews() {
         continue;
       }
 
-      // ----- Gemini rewrite -----
-      if (!GEMINI_API_KEY || geminiCallsToday >= GEMINI_MAX_PER_DAY) {
+      // ----- AI rewrite: Gemini first, Groq as fallback -----
+      if ((!GEMINI_API_KEY || geminiCallsToday >= GEMINI_MAX_PER_DAY) && (!GROQ_API_KEY || groqCallsToday >= GROQ_MAX_PER_DAY)) {
         stats[cat].skippedGemini++;
         continue;
       }
 
-      const result = await rewriteWithGemini(article, cat);
-      geminiCallsToday++;
+      const result = await rewriteArticle(article, cat);
 
       if (!result.text) {
         stats[cat].skippedGemini++;
-        // Self-adjusting backoff: if Google told us how long to wait, honor it
-        // exactly instead of guessing. Otherwise use the normal spacing.
         await new Promise(r => setTimeout(r, result.retryAfterMs || GEMINI_DELAY_MS));
         continue;
       }
 
-      await new Promise(r => setTimeout(r, GEMINI_DELAY_MS));
+      await new Promise(r => setTimeout(r, result.provider === 'groq' ? 2500 : GEMINI_DELAY_MS));
 
       try {
         await Article.create({
@@ -1126,6 +1210,7 @@ async function fetchAllNews() {
   console.log(`\n📊 SUMMARY: +${totalNew} new articles this cycle`);
   console.log(`   Gemini key configured: ${GEMINI_API_KEY ? 'YES' : 'NO — set GEMINI_API_KEY in Render, nothing will publish without it'}`);
   console.log(`   Gemini calls used today: ${geminiCallsToday}/${GEMINI_MAX_PER_DAY}`);
+  console.log(`   Groq key configured: ${GROQ_API_KEY ? 'YES' : 'NO'} — Groq calls used today: ${groqCallsToday}/${GROQ_MAX_PER_DAY}`);
   console.log(`✅ Fetch completed at ${new Date().toLocaleTimeString()}\n`);
 }
 
