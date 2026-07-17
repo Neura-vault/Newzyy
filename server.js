@@ -116,6 +116,86 @@ app.get('/', (req, res) => {
 });
 
 // ════════════════════════════════════════════════════════════
+//  BOT-VISIBLE RENDERING
+//  Plain server-rendered HTML with real article text baked in — no JavaScript
+//  needed to see it. Used only for bots/crawlers/AI tools (routed here by a
+//  Cloudflare Worker sitting in front of the site) — real visitors keep using
+//  the normal fast SPA on GitHub Pages, unaffected.
+// ════════════════════════════════════════════════════════════
+
+function escapeHtmlBasic(str) {
+  return String(str || '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+app.get('/render/home', async (req, res) => {
+  try {
+    const articles = await Article.find({ status: 'published' }).sort({ fetched_at: -1 }).limit(40).lean();
+    const items = attachLiveFields(articles);
+
+    const html = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Newzyy — Independent News, Politics, Technology, Business, Sports, and More</title>
+<meta name="description" content="Newzyy is an independent news outlet covering politics, technology, AI, business, sports, health, science, and world affairs.">
+</head>
+<body>
+<h1>Newzyy — Top World News</h1>
+<p>Newzyy is an independent news outlet covering politics, technology, AI, business, sports, health, science, culture, travel, environment, and world affairs.</p>
+<nav>
+${items.length ? '' : '<p>No articles available right now — please check back shortly.</p>'}
+</nav>
+<main>
+${items.map(a => `
+  <article>
+    <h2><a href="${SITE_URL}/single-post.html?id=${a.id}">${escapeHtmlBasic(a.title)}</a></h2>
+    <p><strong>${escapeHtmlBasic(a.category)}</strong> — by ${escapeHtmlBasic(a.author || 'Newzyy Staff')}, ${escapeHtmlBasic(a.time)}</p>
+    <p>${escapeHtmlBasic(a.excerpt)}</p>
+  </article>
+`).join('\n')}
+</main>
+</body>
+</html>`;
+
+    res.set('Content-Type', 'text/html; charset=utf-8');
+    res.send(html);
+  } catch (e) {
+    res.status(500).send('<html><body><h1>Newzyy</h1><p>Temporarily unavailable.</p></body></html>');
+  }
+});
+
+app.get('/render/article/:id', async (req, res) => {
+  try {
+    const a = await Article.findOne({ id: req.params.id }).lean();
+    if (!a) return res.status(404).send('<html><body><h1>Article not found</h1></body></html>');
+    const article = attachLiveFields([a])[0];
+
+    const html = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>${escapeHtmlBasic(article.title)} — Newzyy</title>
+<meta name="description" content="${escapeHtmlBasic((article.excerpt || '').substring(0, 160))}">
+</head>
+<body>
+<p><a href="${SITE_URL}/">Newzyy Home</a> &gt; ${escapeHtmlBasic(article.category)}</p>
+<h1>${escapeHtmlBasic(article.title)}</h1>
+<p><strong>By ${escapeHtmlBasic(article.author || 'Newzyy Staff')}</strong> — ${escapeHtmlBasic(article.time)}</p>
+<img src="${escapeHtmlBasic(article.image)}" alt="${escapeHtmlBasic(article.title)}">
+<div>
+${(article.body || article.excerpt || '').split(/\n\s*\n/).map(p => `<p>${escapeHtmlBasic(p.trim())}</p>`).join('\n')}
+</div>
+</body>
+</html>`;
+
+    res.set('Content-Type', 'text/html; charset=utf-8');
+    res.send(html);
+  } catch (e) {
+    res.status(500).send('<html><body><h1>Newzyy</h1><p>Temporarily unavailable.</p></body></html>');
+  }
+});
+
+// ════════════════════════════════════════════════════════════
 //  AUTHENTICATION
 // ════════════════════════════════════════════════════════════
 
