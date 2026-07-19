@@ -62,6 +62,28 @@ const GROQ_MAX_PER_DAY = 12000;            // safety margin under Groq's ~14,400
 let groqCallsToday = 0;
 let groqDayStamp = new Date().toDateString();
 
+// ----- Mistral: third AI provider (used mainly for translation load) -----
+const MISTRAL_API_KEY = process.env.MISTRAL_API_KEY;
+const MISTRAL_MODEL = 'mistral-small-latest';
+const MISTRAL_MAX_PER_DAY = 400; // conservative — confirm/raise once real quota is verified on your account
+let mistralCallsToday = 0;
+let mistralDayStamp = new Date().toDateString();
+
+// ========== TRANSLATION LANGUAGES ==========
+// Adding a new language later = add one line here. Nothing else needs to change.
+const LANGUAGES = {
+  ur: { name: 'Urdu', native: 'اردو', rtl: true },
+  hi: { name: 'Hindi', native: 'हिन्दी', rtl: false },
+  ar: { name: 'Arabic', native: 'العربية', rtl: true },
+  es: { name: 'Spanish', native: 'Español', rtl: false },
+  fr: { name: 'French', native: 'Français', rtl: false },
+  bn: { name: 'Bengali', native: 'বাংলা', rtl: false },
+  tr: { name: 'Turkish', native: 'Türkçe', rtl: false },
+  id: { name: 'Indonesian', native: 'Bahasa Indonesia', rtl: false },
+  pt: { name: 'Portuguese', native: 'Português', rtl: false }
+};
+const TRANSLATION_MAX_ROUNDS_PER_CYCLE = 30; // how many articles get a translation pass attempted per cycle
+
 // ========== MONGODB CONNECTION ==========
 const MONGODB_URI = process.env.MONGODB_URI;
 if (!MONGODB_URI) {
@@ -675,10 +697,10 @@ const RSS_FEEDS = {
   politics: 'https://feeds.bbci.co.uk/news/politics/rss.xml',
   world: 'https://feeds.bbci.co.uk/news/world/rss.xml',
   technology: 'https://feeds.bbci.co.uk/news/technology/rss.xml',
-  ai: 'https://artificialintelligence-news.com/feed/',
+  ai: 'https://techcrunch.com/category/artificial-intelligence/feed/',
   business: 'https://feeds.bbci.co.uk/news/business/rss.xml',
   economy: 'https://www.cnbc.com/id/20910258/device/rss/rss.html',
-  health: 'https://medlineplus.gov/groupfeeds/new.xml',
+  health: 'https://feeds.bbci.co.uk/news/health/rss.xml',
   science: 'https://feeds.bbci.co.uk/news/science_and_environment/rss.xml',
   environment: 'https://www.theguardian.com/environment/rss',
   sports: 'https://feeds.bbci.co.uk/sport/rss.xml',
@@ -720,6 +742,27 @@ function attachLiveFields(articles) {
   });
 }
 
+// Only swaps in translated text when ?lang= is explicitly passed AND that
+// translation actually exists yet. No lang param, or translation not ready =
+// English fields returned exactly as before — this can never break existing callers.
+function applyLanguage(article, langCode) {
+  if (!langCode || !LANGUAGES[langCode]) return article;
+  const translation = article.translations && article.translations[langCode];
+  if (!translation) return article; // not translated yet — fall back to English, never show blank
+  return {
+    ...article,
+    title: translation.title,
+    excerpt: translation.excerpt,
+    body: translation.body,
+    lang: langCode,
+    rtl: Boolean(LANGUAGES[langCode].rtl)
+  };
+}
+function applyLanguageToList(articles, langCode) {
+  if (!langCode) return articles;
+  return articles.map(a => applyLanguage(a, langCode));
+}
+
 // ========== GET ALL NEWS (paginated) ==========
 // ?page=1&limit=20&category=technology
 app.get('/api/all-news', async (req, res) => {
@@ -728,6 +771,7 @@ app.get('/api/all-news', async (req, res) => {
     const limit = Math.min(100, parseInt(req.query.limit) || 20);
     const filter = { status: 'published' };
     if (req.query.category) filter.category = req.query.category;
+    const lang = LANGUAGES[req.query.lang] ? req.query.lang : null;
 
     const total = await Article.countDocuments(filter);
     const articles = await Article.find(filter)
@@ -738,7 +782,7 @@ app.get('/api/all-news', async (req, res) => {
 
     res.json({
       success: true,
-      news: attachLiveFields(articles),
+      news: applyLanguageToList(attachLiveFields(articles), lang),
       page,
       limit,
       total,
@@ -755,7 +799,8 @@ app.get('/api/article/:id', async (req, res) => {
   try {
     const article = await Article.findOne({ id: req.params.id }).lean();
     if (!article) return res.status(404).json({ success: false, message: 'Article not found' });
-    res.json({ success: true, article: attachLiveFields([article])[0] });
+    const lang = LANGUAGES[req.query.lang] ? req.query.lang : null;
+    res.json({ success: true, article: applyLanguage(attachLiveFields([article])[0], lang) });
   } catch (e) {
     console.error('article error:', e.message);
     res.status(500).json({ success: false, message: 'Server error' });
@@ -768,6 +813,7 @@ app.get('/api/category/:slug', async (req, res) => {
     const page = Math.max(1, parseInt(req.query.page) || 1);
     const limit = Math.min(100, parseInt(req.query.limit) || 20);
     const filter = { status: 'published', category: req.params.slug };
+    const lang = LANGUAGES[req.query.lang] ? req.query.lang : null;
 
     const total = await Article.countDocuments(filter);
     const articles = await Article.find(filter)
@@ -776,7 +822,7 @@ app.get('/api/category/:slug', async (req, res) => {
       .limit(limit)
       .lean();
 
-    res.json({ success: true, news: attachLiveFields(articles), page, total, totalPages: Math.ceil(total / limit) || 1 });
+    res.json({ success: true, news: applyLanguageToList(attachLiveFields(articles), lang), page, total, totalPages: Math.ceil(total / limit) || 1 });
   } catch (e) {
     console.error('category error:', e.message);
     res.json({ success: true, news: [] });
@@ -1170,6 +1216,166 @@ async function rewriteArticle(rawArticle, category) {
   return { text: null, retryAfterMs: 0, provider: 'none' };
 }
 
+// ════════════════════════════════════════════════════════════
+//  TRANSLATION SYSTEM (separate from the English writing pipeline above —
+//  translates the ALREADY-WRITTEN English article, so every language shows
+//  the exact same set of articles, just in a different language)
+// ════════════════════════════════════════════════════════════
+
+function checkMistralDayReset() {
+  const today = new Date().toDateString();
+  if (today !== mistralDayStamp) {
+    mistralDayStamp = today;
+    mistralCallsToday = 0;
+  }
+}
+
+function parseTranslationJSON(rawText) {
+  if (!rawText) return null;
+  try {
+    const cleaned = rawText.replace(/```json/gi, '').replace(/```/g, '').trim();
+    const jsonMatch = cleaned.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) return null;
+    const parsed = JSON.parse(jsonMatch[0]);
+    if (!parsed.title || !parsed.body) return null;
+    return { title: parsed.title, excerpt: parsed.excerpt || '', body: parsed.body };
+  } catch (e) {
+    return null;
+  }
+}
+
+function buildTranslationPrompt(article, langCode) {
+  const lang = LANGUAGES[langCode];
+  return `Translate the following English news article into ${lang.name} (${lang.native}).
+Write it the way a native ${lang.name}-speaking news writer would — natural and fluent, not a literal word-for-word translation.
+Keep names, places, and numbers accurate. Do not add or remove facts.
+Return ONLY valid JSON, no markdown, no extra commentary, in exactly this format:
+{"title": "...", "excerpt": "...", "body": "..."}
+
+Title: ${article.title}
+Excerpt: ${article.excerpt || ''}
+Body: ${(article.body || '').substring(0, 3000)}`;
+}
+
+async function translateWithGemini(article, langCode) {
+  if (!GEMINI_API_KEY) return null;
+  try {
+    const res = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ contents: [{ parts: [{ text: buildTranslationPrompt(article, langCode) }] }] })
+      }
+    );
+    const data = await res.json();
+    if (!res.ok || data.error) return null;
+    const text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
+    return parseTranslationJSON(text);
+  } catch (e) {
+    console.error('   ⚠️ Gemini translate error:', e.message);
+    return null;
+  }
+}
+
+async function translateWithGroq(article, langCode) {
+  if (!GROQ_API_KEY) return null;
+  try {
+    const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${GROQ_API_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: GROQ_MODEL,
+        messages: [{ role: 'user', content: buildTranslationPrompt(article, langCode) }]
+      })
+    });
+    const data = await res.json();
+    if (!res.ok || data.error) return null;
+    return parseTranslationJSON(data?.choices?.[0]?.message?.content);
+  } catch (e) {
+    console.error('   ⚠️ Groq translate error:', e.message);
+    return null;
+  }
+}
+
+async function translateWithMistral(article, langCode) {
+  if (!MISTRAL_API_KEY) return null;
+  try {
+    const res = await fetch('https://api.mistral.ai/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${MISTRAL_API_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: MISTRAL_MODEL,
+        messages: [{ role: 'user', content: buildTranslationPrompt(article, langCode) }]
+      })
+    });
+    const data = await res.json();
+    if (!res.ok || data.error) return null;
+    return parseTranslationJSON(data?.choices?.[0]?.message?.content);
+  } catch (e) {
+    console.error('   ⚠️ Mistral translate error:', e.message);
+    return null;
+  }
+}
+
+async function translateArticle(article, langCode) {
+  checkGeminiDayReset();
+  checkGroqDayReset();
+  checkMistralDayReset();
+
+  if (GEMINI_API_KEY && geminiCallsToday < GEMINI_MAX_PER_DAY) {
+    geminiCallsToday++;
+    const result = await translateWithGemini(article, langCode);
+    if (result) return result;
+  }
+  if (GROQ_API_KEY && groqCallsToday < GROQ_MAX_PER_DAY) {
+    groqCallsToday++;
+    const result = await translateWithGroq(article, langCode);
+    if (result) return result;
+  }
+  if (MISTRAL_API_KEY && mistralCallsToday < MISTRAL_MAX_PER_DAY) {
+    mistralCallsToday++;
+    const result = await translateWithMistral(article, langCode);
+    if (result) return result;
+  }
+  return null;
+}
+
+async function runTranslationCycle() {
+  console.log(`\n🌐 [${new Date().toLocaleTimeString()}] Starting translation cycle...`);
+  let attempted = 0;
+  let succeeded = 0;
+
+  try {
+    const articles = await Article.find({ status: 'published' }).sort({ fetched_at: -1 }).limit(150).lean();
+
+    outer:
+    for (const article of articles) {
+      const existing = article.translations || {};
+      for (const langCode of Object.keys(LANGUAGES)) {
+        if (existing[langCode]) continue;
+
+        if (attempted >= TRANSLATION_MAX_ROUNDS_PER_CYCLE) break outer;
+        attempted++;
+
+        const result = await translateArticle(article, langCode);
+        if (result) {
+          await Article.updateOne(
+            { id: article.id },
+            { $set: { [`translations.${langCode}`]: { ...result, translatedAt: new Date() } } }
+          );
+          succeeded++;
+        }
+        await new Promise(r => setTimeout(r, 2500));
+      }
+    }
+  } catch (e) {
+    console.error('Translation cycle error:', e.message);
+  }
+
+  console.log(`   ✅ Translation cycle done: ${succeeded}/${attempted} succeeded this run\n`);
+}
+
 // ========== MAIN FETCH FUNCTION (MongoDB, fair round-robin across all categories) ==========
 async function fetchAllNews() {
   console.log(`\n🔄 [${new Date().toLocaleTimeString()}] Starting news fetch (Guardian + diverse RSS, per category)...`);
@@ -1358,6 +1564,28 @@ app.get('/manual-fetch', async (req, res) => {
   }
 });
 
+app.get('/admin/run-translation-now', async (req, res) => {
+  if (!ADMIN_SECRET) return res.status(500).json({ success: false, message: 'ADMIN_SECRET not set on server' });
+  if (req.query.secret !== ADMIN_SECRET) return res.status(403).json({ success: false, message: 'Wrong secret' });
+  runTranslationCycle();
+  res.json({ success: true, message: 'Translation cycle started — check logs for progress.' });
+});
+
+app.get('/api/admin/translation-coverage', async (req, res) => {
+  if (!ADMIN_SECRET) return res.status(500).json({ success: false, message: 'ADMIN_SECRET not set on server' });
+  if (req.query.secret !== ADMIN_SECRET) return res.status(403).json({ success: false, message: 'Wrong secret' });
+  try {
+    const total = await Article.countDocuments({ status: 'published' });
+    const coverage = {};
+    for (const langCode of Object.keys(LANGUAGES)) {
+      coverage[langCode] = await Article.countDocuments({ [`translations.${langCode}`]: { $exists: true } });
+    }
+    res.json({ success: true, total, coverage, languages: LANGUAGES });
+  } catch (e) {
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
 // ========== START SCHEDULE ==========
 mongoose.connection.once('open', () => {
   console.log('📰 Initializing news fetcher (Guardian + diverse RSS, dedicated per category, Gemini rewrite)...');
@@ -1372,6 +1600,15 @@ mongoose.connection.once('open', () => {
   setInterval(async () => {
     await sendDailyDigest().catch(console.error);
   }, 24 * 60 * 60 * 1000);
+
+  // Translation cycle — every 2 hours, starting 20 minutes after boot so it
+  // doesn't compete with the initial news fetch for AI quota at the same instant.
+  setTimeout(() => {
+    runTranslationCycle().catch(console.error);
+    setInterval(async () => {
+      await runTranslationCycle().catch(console.error);
+    }, 2 * 60 * 60 * 1000);
+  }, 20 * 60 * 1000);
 });
 
 // ========== START SERVER ==========
