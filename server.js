@@ -13,7 +13,7 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const rateLimit = require('express-rate-limit');
 const crypto = require('crypto');
-const Article = require('./models/article.js');
+const Article = require('./models/Article');
 const User = require('./models/User');
 const ContactMessage = require('./models/ContactMessage');
 const Subscriber = require('./models/Subscriber');
@@ -151,14 +151,18 @@ function escapeHtmlBasic(str) {
 
 app.get('/render/home', async (req, res) => {
   try {
+    const lang = LANGUAGES[req.query.lang] ? req.query.lang : null;
     const articles = await Article.find({ status: 'published' }).sort({ fetched_at: -1 }).limit(40).lean();
-    const items = attachLiveFields(articles);
+    const items = applyLanguageToList(attachLiveFields(articles), lang);
+    const htmlLang = lang || 'en';
+    const dir = lang && LANGUAGES[lang].rtl ? 'rtl' : 'ltr';
+    const siteTitle = lang ? `Newzyy — ${LANGUAGES[lang].native}` : 'Newzyy — Independent News, Politics, Technology, Business, Sports, and More';
 
     const html = `<!DOCTYPE html>
-<html lang="en">
+<html lang="${htmlLang}" dir="${dir}">
 <head>
 <meta charset="utf-8">
-<title>Newzyy — Independent News, Politics, Technology, Business, Sports, and More</title>
+<title>${escapeHtmlBasic(siteTitle)}</title>
 <meta name="description" content="Newzyy is an independent news outlet covering politics, technology, AI, business, sports, health, science, and world affairs.">
 </head>
 <body>
@@ -170,7 +174,7 @@ ${items.length ? '' : '<p>No articles available right now — please check back 
 <main>
 ${items.map(a => `
   <article>
-    <h2><a href="${SITE_URL}/single-post.html?id=${a.id}">${escapeHtmlBasic(a.title)}</a></h2>
+    <h2><a href="${SITE_URL}/${lang ? lang + '/article.html' : 'single-post.html'}?id=${a.id}">${escapeHtmlBasic(a.title)}</a></h2>
     <p><strong>${escapeHtmlBasic(a.category)}</strong> — by ${escapeHtmlBasic(a.author || 'Newzyy Staff')}, ${escapeHtmlBasic(a.time)}</p>
     <p>${escapeHtmlBasic(a.excerpt)}</p>
   </article>
@@ -188,19 +192,23 @@ ${items.map(a => `
 
 app.get('/render/article/:id', async (req, res) => {
   try {
+    const lang = LANGUAGES[req.query.lang] ? req.query.lang : null;
     const a = await Article.findOne({ id: req.params.id }).lean();
     if (!a) return res.status(404).send('<html><body><h1>Article not found</h1></body></html>');
-    const article = attachLiveFields([a])[0];
+    const article = applyLanguage(attachLiveFields([a])[0], lang);
+    const htmlLang = lang || 'en';
+    const dir = lang && LANGUAGES[lang].rtl ? 'rtl' : 'ltr';
+    const homeUrl = lang ? `${SITE_URL}/${lang}/` : `${SITE_URL}/`;
 
     const html = `<!DOCTYPE html>
-<html lang="en">
+<html lang="${htmlLang}" dir="${dir}">
 <head>
 <meta charset="utf-8">
 <title>${escapeHtmlBasic(article.title)} — Newzyy</title>
 <meta name="description" content="${escapeHtmlBasic((article.excerpt || '').substring(0, 160))}">
 </head>
 <body>
-<p><a href="${SITE_URL}/">Newzyy Home</a> &gt; ${escapeHtmlBasic(article.category)}</p>
+<p><a href="${homeUrl}">Newzyy Home</a> &gt; ${escapeHtmlBasic(article.category)}</p>
 <h1>${escapeHtmlBasic(article.title)}</h1>
 <p><strong>By ${escapeHtmlBasic(article.author || 'Newzyy Staff')}</strong> — ${escapeHtmlBasic(article.time)}</p>
 <img src="${escapeHtmlBasic(article.image)}" alt="${escapeHtmlBasic(article.title)}">
