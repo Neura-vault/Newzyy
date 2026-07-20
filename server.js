@@ -82,7 +82,13 @@ const LANGUAGES = {
   id: { name: 'Indonesian', native: 'Bahasa Indonesia', rtl: false },
   pt: { name: 'Portuguese', native: 'Português', rtl: false }
 };
-const TRANSLATION_MAX_ROUNDS_PER_CYCLE = 30; // how many articles get a translation pass attempted per cycle
+const TRANSLATION_MAX_ROUNDS_PER_CYCLE = 60; // now focused on only the active language(s) below, so budget goes further
+
+// Only languages in this list actually get translated — everything else in
+// LANGUAGES above is "defined but not launched yet" and gets skipped, so
+// quota isn't wasted on pages that don't exist on the frontend yet.
+// Add a language code here only once its /xx/ frontend folder is live.
+const ACTIVE_LANGUAGES = ['ur'];
 
 // ========== MONGODB CONNECTION ==========
 const MONGODB_URI = process.env.MONGODB_URI;
@@ -1360,7 +1366,7 @@ async function runTranslationCycle() {
     outer:
     for (const article of articles) {
       const existing = article.translations || {};
-      for (const langCode of Object.keys(LANGUAGES)) {
+      for (const langCode of ACTIVE_LANGUAGES) {
         if (existing[langCode]) continue;
 
         if (attempted >= TRANSLATION_MAX_ROUNDS_PER_CYCLE) break outer;
