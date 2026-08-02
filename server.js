@@ -88,7 +88,7 @@ const TRANSLATION_MAX_ROUNDS_PER_CYCLE = 60; // now focused on only the active l
 // LANGUAGES above is "defined but not launched yet" and gets skipped, so
 // quota isn't wasted on pages that don't exist on the frontend yet.
 // Add a language code here only once its /xx/ frontend folder is live.
-const ACTIVE_LANGUAGES = ['ur'];
+const ACTIVE_LANGUAGES = ['ur', 'hi', 'ar', 'es', 'fr', 'bn', 'tr', 'id', 'pt'];
 
 // ========== MONGODB CONNECTION ==========
 const MONGODB_URI = process.env.MONGODB_URI;
@@ -158,7 +158,9 @@ function escapeHtmlBasic(str) {
 app.get('/render/home', async (req, res) => {
   try {
     const lang = LANGUAGES[req.query.lang] ? req.query.lang : null;
-    const articles = await Article.find({ status: 'published' }).sort({ fetched_at: -1 }).limit(40).lean();
+    const filter = { status: 'published' };
+    if (lang) filter[`translations.${lang}`] = { $exists: true };
+    const articles = await Article.find(filter).sort({ fetched_at: -1 }).limit(40).lean();
     const items = applyLanguageToList(attachLiveFields(articles), lang);
     const htmlLang = lang || 'en';
     const dir = lang && LANGUAGES[lang].rtl ? 'rtl' : 'ltr';
@@ -201,6 +203,9 @@ app.get('/render/article/:id', async (req, res) => {
     const lang = LANGUAGES[req.query.lang] ? req.query.lang : null;
     const a = await Article.findOne({ id: req.params.id }).lean();
     if (!a) return res.status(404).send('<html><body><h1>Article not found</h1></body></html>');
+    if (lang && !(a.translations && a.translations[lang])) {
+      return res.status(404).send('<html><body><h1>Not translated yet</h1></body></html>');
+    }
     const article = applyLanguage(attachLiveFields([a])[0], lang);
     const htmlLang = lang || 'en';
     const dir = lang && LANGUAGES[lang].rtl ? 'rtl' : 'ltr';
@@ -786,6 +791,8 @@ app.get('/api/all-news', async (req, res) => {
     const filter = { status: 'published' };
     if (req.query.category) filter.category = req.query.category;
     const lang = LANGUAGES[req.query.lang] ? req.query.lang : null;
+    // Only show articles that actually HAVE this translation — no English fallback mixed in.
+    if (lang) filter[`translations.${lang}`] = { $exists: true };
 
     const total = await Article.countDocuments(filter);
     const articles = await Article.find(filter)
@@ -814,6 +821,13 @@ app.get('/api/article/:id', async (req, res) => {
     const article = await Article.findOne({ id: req.params.id }).lean();
     if (!article) return res.status(404).json({ success: false, message: 'Article not found' });
     const lang = LANGUAGES[req.query.lang] ? req.query.lang : null;
+
+    if (lang && !(article.translations && article.translations[lang])) {
+      // Article exists, but not translated into this language yet — say so clearly
+      // instead of silently showing English content on a language-specific page.
+      return res.json({ success: true, article: null, translationPending: true });
+    }
+
     res.json({ success: true, article: applyLanguage(attachLiveFields([article])[0], lang) });
   } catch (e) {
     console.error('article error:', e.message);
@@ -828,6 +842,7 @@ app.get('/api/category/:slug', async (req, res) => {
     const limit = Math.min(100, parseInt(req.query.limit) || 20);
     const filter = { status: 'published', category: req.params.slug };
     const lang = LANGUAGES[req.query.lang] ? req.query.lang : null;
+    if (lang) filter[`translations.${lang}`] = { $exists: true };
 
     const total = await Article.countDocuments(filter);
     const articles = await Article.find(filter)
@@ -865,11 +880,15 @@ app.get('/api/search', async (req, res) => {
 // ========== MOST READ ==========
 app.get('/api/most-read', async (req, res) => {
   try {
-    const articles = await Article.find({ status: 'published' })
+    const lang = LANGUAGES[req.query.lang] ? req.query.lang : null;
+    const filter = { status: 'published' };
+    if (lang) filter[`translations.${lang}`] = { $exists: true };
+
+    const articles = await Article.find(filter)
       .sort({ views: -1 })
       .limit(10)
       .lean();
-    res.json({ success: true, news: attachLiveFields(articles) });
+    res.json({ success: true, news: applyLanguageToList(attachLiveFields(articles), lang) });
   } catch (e) {
     console.error('most-read error:', e.message);
     res.json({ success: true, news: [] });
@@ -1460,6 +1479,30 @@ async function fetchAllNews() {
 
       await new Promise(r => setTimeout(r, result.provider === 'groq' ? 2500 : GEMINI_DELAY_MS));
 
+      // ----- Translate into every active language IN PARALLEL before publishing -----
+      // Nothing goes live (not even English) until every language succeeds. If any
+      // language fails, the whole article is skipped this cycle and retried next time —
+      // never published half-done.
+      const englishDraft = { title: article.title, excerpt: (article.description || '').substring(0, 200), body: result.text };
+      const translationResults = await Promise.all(
+        ACTIVE_LANGUAGES.map(async langCode => ({ langCode, result: await translateArticle(englishDraft, langCode) }))
+      );
+
+      const translations = {};
+      let allTranslationsOk = true;
+      for (const { langCode, result: tResult } of translationResults) {
+        if (tResult) {
+          translations[langCode] = { ...tResult, translatedAt: new Date() };
+        } else {
+          allTranslationsOk = false;
+        }
+      }
+
+      if (!allTranslationsOk) {
+        stats[cat].skippedGemini++; // counted as a skip — will retry as a "new" article next cycle
+        continue;
+      }
+
       try {
         await Article.create({
           id: `auto_${Date.now()}_${Math.random().toString(36).substring(2, 10)}`,
@@ -1476,6 +1519,7 @@ async function fetchAllNews() {
           source_url: article.url,
           source: article.source || 'News',
           rewritten: true,
+          translations,
           fetched_at: new Date()
         });
         existingTitles.add(titleLower);
