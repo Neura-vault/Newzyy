@@ -182,7 +182,7 @@ ${items.length ? '' : '<p>No articles available right now — please check back 
 <main>
 ${items.map(a => `
   <article>
-    <h2><a href="${SITE_URL}/${lang ? lang + '/article.html' : 'single-post.html'}?id=${a.id}">${escapeHtmlBasic(a.title)}</a></h2>
+    <h2><a href="${SITE_URL}/${lang ? lang + '/article/' : 'article/'}?id=${a.id}">${escapeHtmlBasic(a.title)}</a></h2>
     <p><strong>${escapeHtmlBasic(a.category)}</strong> — by ${escapeHtmlBasic(a.author || 'Newzyy Staff')}, ${escapeHtmlBasic(a.time)}</p>
     <p>${escapeHtmlBasic(a.excerpt)}</p>
   </article>
@@ -485,7 +485,7 @@ async function sendWelcomeDigest(email) {
     title: a.title,
     category: CATEGORY_NAMES_BACKEND[a.category] || a.category,
     excerpt: a.excerpt,
-    url: `${SITE_URL}/single-post.html?id=${a.id}`
+    url: `${SITE_URL}/article/?id=${a.id}`
   }));
   const ok = await sendNewsletterDigest(email, articlesForEmail);
   if (ok) await Subscriber.updateOne({ email }, { lastSentAt: new Date() });
@@ -515,7 +515,7 @@ async function sendDailyDigest() {
       title: a.title,
       category: CATEGORY_NAMES_BACKEND[a.category] || a.category,
       excerpt: a.excerpt,
-      url: `${SITE_URL}/single-post.html?id=${a.id}`
+      url: `${SITE_URL}/article/?id=${a.id}`
     }));
 
     const subscribers = await Subscriber.find({ active: true }).lean();
@@ -911,13 +911,13 @@ app.get('/sitemap.xml', async (req, res) => {
     const articles = await Article.find({ status: 'published' }, 'id fetched_at').sort({ fetched_at: -1 }).limit(5000).lean();
     const urls = articles.map(a => `
   <url>
-    <loc>${SITE_URL}/single-post.html?id=${a.id}</loc>
+    <loc>${SITE_URL}/article/?id=${a.id}</loc>
     <lastmod>${new Date(a.fetched_at).toISOString()}</lastmod>
   </url>`).join('');
 
     const xml = `<?xml version="1.0" encoding="UTF-8"?>
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
-  <url><loc>${SITE_URL}/index.html</loc></url>${urls}
+  <url><loc>${SITE_URL}/</loc></url>${urls}
 </urlset>`;
 
     res.header('Content-Type', 'application/xml');
@@ -934,8 +934,8 @@ app.get('/rss.xml', async (req, res) => {
     const items = articles.map(a => `
     <item>
       <title><![CDATA[${a.title}]]></title>
-      <link>${SITE_URL}/single-post.html?id=${a.id}</link>
-      <guid>${SITE_URL}/single-post.html?id=${a.id}</guid>
+      <link>${SITE_URL}/article/?id=${a.id}</link>
+      <guid>${SITE_URL}/article/?id=${a.id}</guid>
       <pubDate>${new Date(a.fetched_at).toUTCString()}</pubDate>
       <description><![CDATA[${a.excerpt || ''}]]></description>
     </item>`).join('');
