@@ -146,13 +146,49 @@ app.get('/', (req, res) => {
 // ════════════════════════════════════════════════════════════
 //  BOT-VISIBLE RENDERING
 //  Plain server-rendered HTML with real article text baked in — no JavaScript
-//  needed to see it. Used only for bots/crawlers/AI tools (routed here by a
-//  Cloudflare Worker sitting in front of the site) — real visitors keep using
-//  the normal fast SPA on GitHub Pages, unaffected.
+//  needed to see it. Not yet wired into the live site's routing (that needs a
+//  hosting-level decision — see chat notes); these endpoints work standalone
+//  today at /render/home and /render/article/:id and can be pointed at once
+//  that decision is made.
 // ════════════════════════════════════════════════════════════
 
 function escapeHtmlBasic(str) {
   return String(str || '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+// ========== ARTICLE BODY SANITIZER ==========
+// Article bodies are now AI-generated HTML, inserted directly into pages
+// (innerHTML on the live site, and raw in /render/article/:id). This is the
+// safety net: only a small allowlist of harmless formatting tags survives,
+// every attribute is stripped from every tag (kills onclick=, javascript:
+// hrefs, etc.), and script/style/iframe blocks are removed tag-and-content —
+// so nothing an AI model (or a prompt-injected source article) outputs can
+// ever execute in a visitor's browser.
+const ARTICLE_HTML_ALLOWED_TAGS = ['p', 'strong', 'em', 'b', 'i', 'blockquote', 'br', 'ul', 'ol', 'li'];
+function sanitizeArticleHtml(html) {
+  if (!html) return '';
+  let out = String(html);
+  // Strip dangerous elements entirely, including their content
+  out = out.replace(/<(script|style|iframe|object|embed|form)[^>]*>[\s\S]*?<\/\1>/gi, '');
+  // Strip any tag not in the allowlist, and strip ALL attributes from tags that stay
+  out = out.replace(/<\/?([a-zA-Z0-9]+)([^>]*)>/g, (match, tag, attrs) => {
+    const lower = tag.toLowerCase();
+    if (!ARTICLE_HTML_ALLOWED_TAGS.includes(lower)) return '';
+    const isClosing = match.startsWith('</');
+    if (lower === 'br') return '<br>';
+    return isClosing ? `</${lower}>` : `<${lower}>`;
+  });
+  return out.trim();
+}
+
+// Articles published after this change already have body as sanitized HTML
+// (<p> tags). Articles published before it are still plain text. This lets
+// every article — old or new — render correctly without a one-time DB migration.
+function formatArticleBodyForRender(body) {
+  const b = (body || '').trim();
+  if (!b) return '';
+  if (/<p[\s>]/i.test(b)) return sanitizeArticleHtml(b); // already HTML — sanitize defensively, use as-is
+  return b.split(/\n\s*\n/).map(p => `<p>${escapeHtmlBasic(p.trim())}</p>`).join('\n'); // legacy plain text
 }
 
 app.get('/render/home', async (req, res) => {
@@ -222,9 +258,9 @@ app.get('/render/article/:id', async (req, res) => {
 <p><a href="${homeUrl}">Newzyy Home</a> &gt; ${escapeHtmlBasic(article.category)}</p>
 <h1>${escapeHtmlBasic(article.title)}</h1>
 <p><strong>By ${escapeHtmlBasic(article.author || 'Newzyy Staff')}</strong> — ${escapeHtmlBasic(article.time)}</p>
-<img src="${escapeHtmlBasic(article.image)}" alt="${escapeHtmlBasic(article.title)}">
+<img src="${escapeHtmlBasic(article.image)}" alt="${escapeHtmlBasic(article.imageAlt || article.title)}">
 <div>
-${(article.body || article.excerpt || '').split(/\n\s*\n/).map(p => `<p>${escapeHtmlBasic(p.trim())}</p>`).join('\n')}
+${formatArticleBodyForRender(article.body || article.excerpt)}
 </div>
 </body>
 </html>`;
@@ -1119,7 +1155,7 @@ async function rewriteWithGemini(rawArticle, category) {
 Using ONLY the facts below, write an original news article in your own words — do not copy sentences or phrasing from the source text.
 If the source facts are limited, write a shorter article rather than inventing extra details, numbers, quotes, or names that aren't in the source.
 Length: 150-400 words depending on how much source material is available. Tone: clear, neutral, professional news style.
-Output ONLY the article body text. No headline, no preamble, no markdown.
+Format the output as HTML: wrap every paragraph in a <p> tag, nothing else. No headline, no preamble, no markdown, no <html>/<body>/<div> wrapper — just the <p> tags, one per paragraph, back to back.
 
 Headline: ${rawArticle.title}
 Category: ${category}
@@ -1154,7 +1190,8 @@ ${sourceFacts}`;
       console.error('   ⚠️ Gemini returned no text. Full response:', JSON.stringify(data).substring(0, 500));
       return { text: null, retryAfterMs: 0 };
     }
-    return { text: text.trim().length > 80 ? text.trim() : null, retryAfterMs: 0 };
+    const clean = sanitizeArticleHtml(text.trim());
+    return { text: clean.length > 80 ? clean : null, retryAfterMs: 0 };
   } catch (e) {
     console.error('   ⚠️ Gemini rewrite error:', e.message);
     return { text: null, retryAfterMs: 0 };
@@ -1190,7 +1227,7 @@ async function rewriteWithGroq(rawArticle, category) {
 Using ONLY the facts below, write an original news article in your own words — do not copy sentences or phrasing from the source text.
 If the source facts are limited, write a shorter article rather than inventing extra details, numbers, quotes, or names that aren't in the source.
 Length: 150-400 words depending on how much source material is available. Tone: clear, neutral, professional news style.
-Output ONLY the article body text. No headline, no preamble, no markdown.
+Format the output as HTML: wrap every paragraph in a <p> tag, nothing else. No headline, no preamble, no markdown, no <html>/<body>/<div> wrapper — just the <p> tags, one per paragraph, back to back.
 
 Headline: ${rawArticle.title}
 Category: ${category}
@@ -1218,7 +1255,8 @@ ${sourceFacts}`;
 
     const text = data?.choices?.[0]?.message?.content;
     if (!text) return { text: null, retryAfterMs: 0 };
-    return { text: text.trim().length > 80 ? text.trim() : null, retryAfterMs: 0 };
+    const clean = sanitizeArticleHtml(text.trim());
+    return { text: clean.length > 80 ? clean : null, retryAfterMs: 0 };
   } catch (e) {
     console.error('   ⚠️ Groq rewrite error:', e.message);
     return { text: null, retryAfterMs: 0 };
@@ -1271,7 +1309,7 @@ function parseTranslationJSON(rawText) {
     if (!jsonMatch) return null;
     const parsed = JSON.parse(jsonMatch[0]);
     if (!parsed.title || !parsed.body) return null;
-    return { title: parsed.title, excerpt: parsed.excerpt || '', body: parsed.body };
+    return { title: parsed.title, excerpt: parsed.excerpt || '', body: sanitizeArticleHtml(parsed.body) };
   } catch (e) {
     return null;
   }
@@ -1282,6 +1320,7 @@ function buildTranslationPrompt(article, langCode) {
   return `Translate the following English news article into ${lang.name} (${lang.native}).
 Write it the way a native ${lang.name}-speaking news writer would — natural and fluent, not a literal word-for-word translation.
 Keep names, places, and numbers accurate. Do not add or remove facts.
+The Body field contains HTML <p> tags wrapping each paragraph — keep that exact same <p> tag structure in your translated output (same number of <p> tags, one per paragraph), translating only the text inside them. Do not translate or alter the tags themselves.
 Return ONLY valid JSON, no markdown, no extra commentary, in exactly this format:
 {"title": "...", "excerpt": "...", "body": "..."}
 
@@ -1514,6 +1553,7 @@ async function fetchAllNews() {
           views: Math.floor(Math.random() * 5000) + 100,
           comments: Math.floor(Math.random() * 200),
           image: article.image,
+          imageAlt: article.title,
           status: 'published',
           // Kept internally for editorial record-keeping only — not shown on the site.
           source_url: article.url,
