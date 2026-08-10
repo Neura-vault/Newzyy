@@ -15,6 +15,7 @@ const articleSchema = new mongoose.Schema({
   views: { type: Number, default: 0 },
   comments: { type: Number, default: 0 },
   image: String,
+  imageAlt: String, // alt text for the image — set from the article title at save time
   status: { type: String, default: 'published', index: true },
   source_url: String,
   source: String,
