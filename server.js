@@ -1155,7 +1155,7 @@ async function rewriteWithGemini(rawArticle, category) {
 Using ONLY the facts below, write an original news article in your own words — do not copy sentences or phrasing from the source text.
 If the source facts are limited, write a shorter article rather than inventing extra details, numbers, quotes, or names that aren't in the source.
 Length: 150-400 words depending on how much source material is available. Tone: clear, neutral, professional news style.
-Format the output as HTML: wrap every paragraph in a <p> tag, nothing else. No headline, no preamble, no markdown, no <html>/<body>/<div> wrapper — just the <p> tags, one per paragraph, back to back.
+Format the output as HTML: No headline, no preamble, no markdown, no <html>/<body>/<div> wrapper.
 
 Headline: ${rawArticle.title}
 Category: ${category}
@@ -1227,7 +1227,7 @@ async function rewriteWithGroq(rawArticle, category) {
 Using ONLY the facts below, write an original news article in your own words — do not copy sentences or phrasing from the source text.
 If the source facts are limited, write a shorter article rather than inventing extra details, numbers, quotes, or names that aren't in the source.
 Length: 150-400 words depending on how much source material is available. Tone: clear, neutral, professional news style.
-Format the output as HTML: wrap every paragraph in a <p> tag, nothing else. No headline, no preamble, no markdown, no <html>/<body>/<div> wrapper — just the <p> tags, one per paragraph, back to back.
+Format the output as HTML: nothing else. No headline, no preamble, no markdown, no <html>/<body>/<div> wrapper.
 
 Headline: ${rawArticle.title}
 Category: ${category}
