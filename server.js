@@ -62,12 +62,26 @@ const GROQ_MAX_PER_DAY = 12000;            // safety margin under Groq's ~14,400
 let groqCallsToday = 0;
 let groqDayStamp = new Date().toDateString();
 
-// ----- Mistral: third AI provider (used mainly for translation load) -----
+// ----- Mistral: third AI provider (used for translation, and now also as a rewrite fallback) -----
 const MISTRAL_API_KEY = process.env.MISTRAL_API_KEY;
 const MISTRAL_MODEL = 'mistral-small-latest';
 const MISTRAL_MAX_PER_DAY = 400; // conservative — confirm/raise once real quota is verified on your account
 let mistralCallsToday = 0;
 let mistralDayStamp = new Date().toDateString();
+
+// ----- Cerebras: fourth AI provider (rewrite fallback — free tier, OpenAI-compatible, very fast) -----
+const CEREBRAS_API_KEY = process.env.CEREBRAS_API_KEY;
+const CEREBRAS_MODEL = 'llama-3.3-70b';
+const CEREBRAS_MAX_PER_DAY = 800; // conservative — Cerebras free tier is generous, raise once confirmed on your account
+let cerebrasCallsToday = 0;
+let cerebrasDayStamp = new Date().toDateString();
+
+// ----- Cohere: fifth AI provider (rewrite fallback — free trial tier, Command R) -----
+const COHERE_API_KEY = process.env.COHERE_API_KEY;
+const COHERE_MODEL = 'command-r-08-2024';
+const COHERE_MAX_PER_DAY = 800; // Cohere trial keys are typically ~1000 calls/month — conservative daily slice
+let cohereCallsToday = 0;
+let cohereDayStamp = new Date().toDateString();
 
 // ========== TRANSLATION LANGUAGES ==========
 // Adding a new language later = add one line here. Nothing else needs to change.
@@ -638,7 +652,10 @@ app.get('/api/admin/stats', async (req, res) => {
       stats: { articleCount, userCount, subscriberCount, contactCount },
       perCategory,
       gemini: { callsToday: geminiCallsToday, maxPerDay: GEMINI_MAX_PER_DAY },
-      groq: { configured: Boolean(GROQ_API_KEY), callsToday: groqCallsToday, maxPerDay: GROQ_MAX_PER_DAY }
+      groq: { configured: Boolean(GROQ_API_KEY), callsToday: groqCallsToday, maxPerDay: GROQ_MAX_PER_DAY },
+      mistral: { configured: Boolean(MISTRAL_API_KEY), callsToday: mistralCallsToday, maxPerDay: MISTRAL_MAX_PER_DAY },
+      cerebras: { configured: Boolean(CEREBRAS_API_KEY), callsToday: cerebrasCallsToday, maxPerDay: CEREBRAS_MAX_PER_DAY },
+      cohere: { configured: Boolean(COHERE_API_KEY), callsToday: cohereCallsToday, maxPerDay: COHERE_MAX_PER_DAY }
     });
   } catch (e) {
     res.status(500).json({ success: false, message: e.message });
@@ -1155,7 +1172,7 @@ async function rewriteWithGemini(rawArticle, category) {
 Using ONLY the facts below, write an original news article in your own words — do not copy sentences or phrasing from the source text.
 If the source facts are limited, write a shorter article rather than inventing extra details, numbers, quotes, or names that aren't in the source.
 Length: 150-400 words depending on how much source material is available. Tone: clear, neutral, professional news style.
-Format the output as HTML: No headline, no preamble, no markdown, no <html>/<body>/<div> wrapper.
+Format the output as HTML: wrap every paragraph in a <p> tag, nothing else. No headline, no preamble, no markdown, no <html>/<body>/<div> wrapper — just the <p> tags, one per paragraph, back to back.
 
 Headline: ${rawArticle.title}
 Category: ${category}
@@ -1216,6 +1233,22 @@ function checkGroqDayReset() {
   }
 }
 
+// Shared by the newer rewrite providers below (Mistral/Cerebras/Cohere) —
+// identical wording to what Gemini/Groq already use, just factored out so it
+// isn't repeated three more times.
+function buildRewritePrompt(rawArticle, category, sourceFacts) {
+  return `You are a staff news writer for "Newzyy", an independent news outlet.
+Using ONLY the facts below, write an original news article in your own words — do not copy sentences or phrasing from the source text.
+If the source facts are limited, write a shorter article rather than inventing extra details, numbers, quotes, or names that aren't in the source.
+Length: 150-400 words depending on how much source material is available. Tone: clear, neutral, professional news style.
+Format the output as HTML: wrap every paragraph in a <p> tag, nothing else. No headline, no preamble, no markdown, no <html>/<body>/<div> wrapper — just the <p> tags, one per paragraph, back to back.
+
+Headline: ${rawArticle.title}
+Category: ${category}
+Source facts:
+${sourceFacts}`;
+}
+
 // ========== GROQ REWRITE (fallback provider) ==========
 async function rewriteWithGroq(rawArticle, category) {
   if (!GROQ_API_KEY) return { text: null, retryAfterMs: 0 };
@@ -1227,7 +1260,7 @@ async function rewriteWithGroq(rawArticle, category) {
 Using ONLY the facts below, write an original news article in your own words — do not copy sentences or phrasing from the source text.
 If the source facts are limited, write a shorter article rather than inventing extra details, numbers, quotes, or names that aren't in the source.
 Length: 150-400 words depending on how much source material is available. Tone: clear, neutral, professional news style.
-Format the output as HTML: nothing else. No headline, no preamble, no markdown, no <html>/<body>/<div> wrapper.
+Format the output as HTML: wrap every paragraph in a <p> tag, nothing else. No headline, no preamble, no markdown, no <html>/<body>/<div> wrapper — just the <p> tags, one per paragraph, back to back.
 
 Headline: ${rawArticle.title}
 Category: ${category}
@@ -1263,25 +1296,156 @@ ${sourceFacts}`;
   }
 }
 
-// ========== COMBINED REWRITE: Gemini first, Groq as fallback ==========
-// Genuinely combines two separate companies' free quotas — not multiple
-// accounts on the same service, which would risk violating either ToS.
+// ========== MISTRAL REWRITE (fallback provider) ==========
+async function rewriteWithMistral(rawArticle, category) {
+  if (!MISTRAL_API_KEY) return { text: null, retryAfterMs: 0 };
+
+  const sourceFacts = (rawArticle.body || rawArticle.description || '').substring(0, 3000);
+  if (!sourceFacts.trim()) return { text: null, retryAfterMs: 0 };
+
+  try {
+    const res = await fetch('https://api.mistral.ai/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${MISTRAL_API_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: MISTRAL_MODEL,
+        messages: [{ role: 'user', content: buildRewritePrompt(rawArticle, category, sourceFacts) }]
+      })
+    });
+    const data = await res.json();
+
+    if (!res.ok || data.error) {
+      console.error(`   ⚠️ Mistral rewrite API error [${res.status}]:`, data.error?.message || JSON.stringify(data).substring(0, 300));
+      const retryAfter = res.headers.get('retry-after');
+      const retryAfterMs = retryAfter ? Math.min(parseInt(retryAfter) * 1000, 70000) : 0;
+      return { text: null, retryAfterMs };
+    }
+
+    const text = data?.choices?.[0]?.message?.content;
+    if (!text) return { text: null, retryAfterMs: 0 };
+    const clean = sanitizeArticleHtml(text.trim());
+    return { text: clean.length > 80 ? clean : null, retryAfterMs: 0 };
+  } catch (e) {
+    console.error('   ⚠️ Mistral rewrite error:', e.message);
+    return { text: null, retryAfterMs: 0 };
+  }
+}
+
+// ========== CEREBRAS REWRITE (fallback provider) ==========
+// OpenAI-compatible API, free tier, very fast inference.
+async function rewriteWithCerebras(rawArticle, category) {
+  if (!CEREBRAS_API_KEY) return { text: null, retryAfterMs: 0 };
+
+  const sourceFacts = (rawArticle.body || rawArticle.description || '').substring(0, 3000);
+  if (!sourceFacts.trim()) return { text: null, retryAfterMs: 0 };
+
+  try {
+    const res = await fetch('https://api.cerebras.ai/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${CEREBRAS_API_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: CEREBRAS_MODEL,
+        messages: [{ role: 'user', content: buildRewritePrompt(rawArticle, category, sourceFacts) }]
+      })
+    });
+    const data = await res.json();
+
+    if (!res.ok || data.error) {
+      console.error(`   ⚠️ Cerebras API error [${res.status}]:`, data.error?.message || JSON.stringify(data).substring(0, 300));
+      const retryAfter = res.headers.get('retry-after');
+      const retryAfterMs = retryAfter ? Math.min(parseInt(retryAfter) * 1000, 70000) : 0;
+      return { text: null, retryAfterMs };
+    }
+
+    const text = data?.choices?.[0]?.message?.content;
+    if (!text) return { text: null, retryAfterMs: 0 };
+    const clean = sanitizeArticleHtml(text.trim());
+    return { text: clean.length > 80 ? clean : null, retryAfterMs: 0 };
+  } catch (e) {
+    console.error('   ⚠️ Cerebras rewrite error:', e.message);
+    return { text: null, retryAfterMs: 0 };
+  }
+}
+
+// ========== COHERE REWRITE (fallback provider) ==========
+// Cohere's Chat v2 API — different request/response shape from the
+// OpenAI-style providers above, handled separately.
+async function rewriteWithCohere(rawArticle, category) {
+  if (!COHERE_API_KEY) return { text: null, retryAfterMs: 0 };
+
+  const sourceFacts = (rawArticle.body || rawArticle.description || '').substring(0, 3000);
+  if (!sourceFacts.trim()) return { text: null, retryAfterMs: 0 };
+
+  try {
+    const res = await fetch('https://api.cohere.com/v2/chat', {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${COHERE_API_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: COHERE_MODEL,
+        messages: [{ role: 'user', content: buildRewritePrompt(rawArticle, category, sourceFacts) }]
+      })
+    });
+    const data = await res.json();
+
+    if (!res.ok || data.error || data.message?.error) {
+      console.error(`   ⚠️ Cohere API error [${res.status}]:`, data.error?.message || JSON.stringify(data).substring(0, 300));
+      const retryAfter = res.headers.get('retry-after');
+      const retryAfterMs = retryAfter ? Math.min(parseInt(retryAfter) * 1000, 70000) : 0;
+      return { text: null, retryAfterMs };
+    }
+
+    const text = data?.message?.content?.[0]?.text;
+    if (!text) return { text: null, retryAfterMs: 0 };
+    const clean = sanitizeArticleHtml(text.trim());
+    return { text: clean.length > 80 ? clean : null, retryAfterMs: 0 };
+  } catch (e) {
+    console.error('   ⚠️ Cohere rewrite error:', e.message);
+    return { text: null, retryAfterMs: 0 };
+  }
+}
+
+// ========== COMBINED REWRITE: 5 providers in a fallback chain ==========
+// Genuinely combines five separate companies' free quotas — not multiple
+// accounts on the same service, which would risk violating any of their ToS.
+// Order: Gemini → Groq → Mistral → Cerebras → Cohere. Stops at the first
+// provider that returns usable text; only moves to the next on quota
+// exhaustion or an API error.
 async function rewriteArticle(rawArticle, category) {
   checkGeminiDayReset();
   checkGroqDayReset();
+  checkMistralDayReset();
+  checkCerebrasDayReset();
+  checkCohereDayReset();
 
   if (GEMINI_API_KEY && geminiCallsToday < GEMINI_MAX_PER_DAY) {
     const result = await rewriteWithGemini(rawArticle, category);
     geminiCallsToday++;
     if (result.text) return { ...result, provider: 'gemini' };
-    // Gemini failed (quota/error) — fall through to Groq below.
+    // Gemini failed (quota/error) — fall through to the next provider.
   }
 
   if (GROQ_API_KEY && groqCallsToday < GROQ_MAX_PER_DAY) {
     const result = await rewriteWithGroq(rawArticle, category);
     groqCallsToday++;
     if (result.text) return { ...result, provider: 'groq' };
-    return { ...result, provider: 'groq' };
+  }
+
+  if (MISTRAL_API_KEY && mistralCallsToday < MISTRAL_MAX_PER_DAY) {
+    const result = await rewriteWithMistral(rawArticle, category);
+    mistralCallsToday++;
+    if (result.text) return { ...result, provider: 'mistral' };
+  }
+
+  if (CEREBRAS_API_KEY && cerebrasCallsToday < CEREBRAS_MAX_PER_DAY) {
+    const result = await rewriteWithCerebras(rawArticle, category);
+    cerebrasCallsToday++;
+    if (result.text) return { ...result, provider: 'cerebras' };
+  }
+
+  if (COHERE_API_KEY && cohereCallsToday < COHERE_MAX_PER_DAY) {
+    const result = await rewriteWithCohere(rawArticle, category);
+    cohereCallsToday++;
+    if (result.text) return { ...result, provider: 'cohere' };
   }
 
   return { text: null, retryAfterMs: 0, provider: 'none' };
@@ -1298,6 +1462,22 @@ function checkMistralDayReset() {
   if (today !== mistralDayStamp) {
     mistralDayStamp = today;
     mistralCallsToday = 0;
+  }
+}
+
+function checkCerebrasDayReset() {
+  const today = new Date().toDateString();
+  if (today !== cerebrasDayStamp) {
+    cerebrasDayStamp = today;
+    cerebrasCallsToday = 0;
+  }
+}
+
+function checkCohereDayReset() {
+  const today = new Date().toDateString();
+  if (today !== cohereDayStamp) {
+    cohereDayStamp = today;
+    cohereCallsToday = 0;
   }
 }
 
@@ -1502,8 +1682,14 @@ async function fetchAllNews() {
         continue;
       }
 
-      // ----- AI rewrite: Gemini first, Groq as fallback -----
-      if ((!GEMINI_API_KEY || geminiCallsToday >= GEMINI_MAX_PER_DAY) && (!GROQ_API_KEY || groqCallsToday >= GROQ_MAX_PER_DAY)) {
+      // ----- AI rewrite: Gemini → Groq → Mistral → Cerebras → Cohere -----
+      const noProviderLeft =
+        (!GEMINI_API_KEY || geminiCallsToday >= GEMINI_MAX_PER_DAY) &&
+        (!GROQ_API_KEY || groqCallsToday >= GROQ_MAX_PER_DAY) &&
+        (!MISTRAL_API_KEY || mistralCallsToday >= MISTRAL_MAX_PER_DAY) &&
+        (!CEREBRAS_API_KEY || cerebrasCallsToday >= CEREBRAS_MAX_PER_DAY) &&
+        (!COHERE_API_KEY || cohereCallsToday >= COHERE_MAX_PER_DAY);
+      if (noProviderLeft) {
         stats[cat].skippedGemini++;
         continue;
       }
@@ -1595,6 +1781,9 @@ async function fetchAllNews() {
   console.log(`   Gemini key configured: ${GEMINI_API_KEY ? 'YES' : 'NO — set GEMINI_API_KEY in Render, nothing will publish without it'}`);
   console.log(`   Gemini calls used today: ${geminiCallsToday}/${GEMINI_MAX_PER_DAY}`);
   console.log(`   Groq key configured: ${GROQ_API_KEY ? 'YES' : 'NO'} — Groq calls used today: ${groqCallsToday}/${GROQ_MAX_PER_DAY}`);
+  console.log(`   Mistral key configured: ${MISTRAL_API_KEY ? 'YES' : 'NO'} — Mistral calls used today: ${mistralCallsToday}/${MISTRAL_MAX_PER_DAY}`);
+  console.log(`   Cerebras key configured: ${CEREBRAS_API_KEY ? 'YES' : 'NO'} — Cerebras calls used today: ${cerebrasCallsToday}/${CEREBRAS_MAX_PER_DAY}`);
+  console.log(`   Cohere key configured: ${COHERE_API_KEY ? 'YES' : 'NO'} — Cohere calls used today: ${cohereCallsToday}/${COHERE_MAX_PER_DAY}`);
   console.log(`✅ Fetch completed at ${new Date().toLocaleTimeString()}\n`);
 }
 
