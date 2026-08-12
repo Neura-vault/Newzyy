@@ -48,9 +48,14 @@ const VERIFICATION_CODE_TTL_MIN = 15;
 // Google's own suggested wait time from each 429 response and back off exactly that
 // long — self-adjusting to whatever the real limit is, never guessing wrong.
 const GEMINI_DELAY_MS = 6000;              // base spacing between successful calls
-const GEMINI_MAX_PER_DAY = 1200;           // safety ceiling only — raise once real quota is confirmed higher
+// Split so a busy rewrite cycle can never starve translation of quota (and vice
+// versa) — translation gets the bigger share since one article needs 9 translation
+// calls (one per language) but only 1 rewrite call.
+const GEMINI_REWRITE_MAX_PER_DAY = 360;
+const GEMINI_TRANSLATE_MAX_PER_DAY = 840;
 const GEMINI_MAX_ROUNDS_PER_CYCLE = 20;    // cap how many articles per category one cycle will attempt
-let geminiCallsToday = 0;
+let geminiRewriteCallsToday = 0;
+let geminiTranslateCallsToday = 0;
 let geminiDayStamp = new Date().toDateString();
 
 // ----- Groq: second AI provider (separate free account, separate quota) -----
@@ -58,15 +63,19 @@ let geminiDayStamp = new Date().toDateString();
 // companies' free tiers rather than trying to bypass either one's limits.
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
 const GROQ_MODEL = 'llama-3.1-8b-instant'; // most generous free-tier limits on Groq
-const GROQ_MAX_PER_DAY = 12000;            // safety margin under Groq's ~14,400/day
-let groqCallsToday = 0;
+const GROQ_REWRITE_MAX_PER_DAY = 3600;
+const GROQ_TRANSLATE_MAX_PER_DAY = 8400;
+let groqRewriteCallsToday = 0;
+let groqTranslateCallsToday = 0;
 let groqDayStamp = new Date().toDateString();
 
 // ----- Mistral: third AI provider (used for translation, and now also as a rewrite fallback) -----
 const MISTRAL_API_KEY = process.env.MISTRAL_API_KEY;
 const MISTRAL_MODEL = 'mistral-small-latest';
-const MISTRAL_MAX_PER_DAY = 400; // conservative — confirm/raise once real quota is verified on your account
-let mistralCallsToday = 0;
+const MISTRAL_REWRITE_MAX_PER_DAY = 120;
+const MISTRAL_TRANSLATE_MAX_PER_DAY = 280;
+let mistralRewriteCallsToday = 0;
+let mistralTranslateCallsToday = 0;
 let mistralDayStamp = new Date().toDateString();
 
 // ----- Cerebras: fourth AI provider (rewrite fallback — free tier, OpenAI-compatible, very fast) -----
@@ -651,11 +660,28 @@ app.get('/api/admin/stats', async (req, res) => {
       success: true,
       stats: { articleCount, userCount, subscriberCount, contactCount },
       perCategory,
-      gemini: { callsToday: geminiCallsToday, maxPerDay: GEMINI_MAX_PER_DAY },
-      groq: { configured: Boolean(GROQ_API_KEY), callsToday: groqCallsToday, maxPerDay: GROQ_MAX_PER_DAY },
-      mistral: { configured: Boolean(MISTRAL_API_KEY), callsToday: mistralCallsToday, maxPerDay: MISTRAL_MAX_PER_DAY },
-      cerebras: { configured: Boolean(CEREBRAS_API_KEY), callsToday: cerebrasCallsToday, maxPerDay: CEREBRAS_MAX_PER_DAY },
-      cohere: { configured: Boolean(COHERE_API_KEY), callsToday: cohereCallsToday, maxPerDay: COHERE_MAX_PER_DAY }
+      ai: {
+        gemini: {
+          configured: Boolean(GEMINI_API_KEY),
+          rewrite: { callsToday: geminiRewriteCallsToday, maxPerDay: GEMINI_REWRITE_MAX_PER_DAY },
+          translate: { callsToday: geminiTranslateCallsToday, maxPerDay: GEMINI_TRANSLATE_MAX_PER_DAY }
+        },
+        groq: {
+          configured: Boolean(GROQ_API_KEY),
+          rewrite: { callsToday: groqRewriteCallsToday, maxPerDay: GROQ_REWRITE_MAX_PER_DAY },
+          translate: { callsToday: groqTranslateCallsToday, maxPerDay: GROQ_TRANSLATE_MAX_PER_DAY }
+        },
+        mistral: {
+          configured: Boolean(MISTRAL_API_KEY),
+          rewrite: { callsToday: mistralRewriteCallsToday, maxPerDay: MISTRAL_REWRITE_MAX_PER_DAY },
+          translate: { callsToday: mistralTranslateCallsToday, maxPerDay: MISTRAL_TRANSLATE_MAX_PER_DAY }
+        },
+        cerebras: { configured: Boolean(CEREBRAS_API_KEY), callsToday: cerebrasCallsToday, maxPerDay: CEREBRAS_MAX_PER_DAY, rewriteOnly: true },
+        cohere: { configured: Boolean(COHERE_API_KEY), callsToday: cohereCallsToday, maxPerDay: COHERE_MAX_PER_DAY, rewriteOnly: true }
+      },
+      // Kept for any older client still reading the old flat shape.
+      gemini: { callsToday: geminiRewriteCallsToday + geminiTranslateCallsToday, maxPerDay: GEMINI_REWRITE_MAX_PER_DAY + GEMINI_TRANSLATE_MAX_PER_DAY },
+      groq: { configured: Boolean(GROQ_API_KEY), callsToday: groqRewriteCallsToday + groqTranslateCallsToday, maxPerDay: GROQ_REWRITE_MAX_PER_DAY + GROQ_TRANSLATE_MAX_PER_DAY }
     });
   } catch (e) {
     res.status(500).json({ success: false, message: e.message });
@@ -1222,14 +1248,16 @@ function checkGeminiDayReset() {
   const today = new Date().toDateString();
   if (today !== geminiDayStamp) {
     geminiDayStamp = today;
-    geminiCallsToday = 0;
+    geminiRewriteCallsToday = 0;
+    geminiTranslateCallsToday = 0;
   }
 }
 function checkGroqDayReset() {
   const today = new Date().toDateString();
   if (today !== groqDayStamp) {
     groqDayStamp = today;
-    groqCallsToday = 0;
+    groqRewriteCallsToday = 0;
+    groqTranslateCallsToday = 0;
   }
 }
 
@@ -1417,22 +1445,22 @@ async function rewriteArticle(rawArticle, category) {
   checkCerebrasDayReset();
   checkCohereDayReset();
 
-  if (GEMINI_API_KEY && geminiCallsToday < GEMINI_MAX_PER_DAY) {
+  if (GEMINI_API_KEY && geminiRewriteCallsToday < GEMINI_REWRITE_MAX_PER_DAY) {
     const result = await rewriteWithGemini(rawArticle, category);
-    geminiCallsToday++;
+    geminiRewriteCallsToday++;
     if (result.text) return { ...result, provider: 'gemini' };
     // Gemini failed (quota/error) — fall through to the next provider.
   }
 
-  if (GROQ_API_KEY && groqCallsToday < GROQ_MAX_PER_DAY) {
+  if (GROQ_API_KEY && groqRewriteCallsToday < GROQ_REWRITE_MAX_PER_DAY) {
     const result = await rewriteWithGroq(rawArticle, category);
-    groqCallsToday++;
+    groqRewriteCallsToday++;
     if (result.text) return { ...result, provider: 'groq' };
   }
 
-  if (MISTRAL_API_KEY && mistralCallsToday < MISTRAL_MAX_PER_DAY) {
+  if (MISTRAL_API_KEY && mistralRewriteCallsToday < MISTRAL_REWRITE_MAX_PER_DAY) {
     const result = await rewriteWithMistral(rawArticle, category);
-    mistralCallsToday++;
+    mistralRewriteCallsToday++;
     if (result.text) return { ...result, provider: 'mistral' };
   }
 
@@ -1461,7 +1489,8 @@ function checkMistralDayReset() {
   const today = new Date().toDateString();
   if (today !== mistralDayStamp) {
     mistralDayStamp = today;
-    mistralCallsToday = 0;
+    mistralRewriteCallsToday = 0;
+    mistralTranslateCallsToday = 0;
   }
 }
 
@@ -1575,18 +1604,18 @@ async function translateArticle(article, langCode) {
   checkGroqDayReset();
   checkMistralDayReset();
 
-  if (GEMINI_API_KEY && geminiCallsToday < GEMINI_MAX_PER_DAY) {
-    geminiCallsToday++;
+  if (GEMINI_API_KEY && geminiTranslateCallsToday < GEMINI_TRANSLATE_MAX_PER_DAY) {
+    geminiTranslateCallsToday++;
     const result = await translateWithGemini(article, langCode);
     if (result) return result;
   }
-  if (GROQ_API_KEY && groqCallsToday < GROQ_MAX_PER_DAY) {
-    groqCallsToday++;
+  if (GROQ_API_KEY && groqTranslateCallsToday < GROQ_TRANSLATE_MAX_PER_DAY) {
+    groqTranslateCallsToday++;
     const result = await translateWithGroq(article, langCode);
     if (result) return result;
   }
-  if (MISTRAL_API_KEY && mistralCallsToday < MISTRAL_MAX_PER_DAY) {
-    mistralCallsToday++;
+  if (MISTRAL_API_KEY && mistralTranslateCallsToday < MISTRAL_TRANSLATE_MAX_PER_DAY) {
+    mistralTranslateCallsToday++;
     const result = await translateWithMistral(article, langCode);
     if (result) return result;
   }
@@ -1684,9 +1713,9 @@ async function fetchAllNews() {
 
       // ----- AI rewrite: Gemini → Groq → Mistral → Cerebras → Cohere -----
       const noProviderLeft =
-        (!GEMINI_API_KEY || geminiCallsToday >= GEMINI_MAX_PER_DAY) &&
-        (!GROQ_API_KEY || groqCallsToday >= GROQ_MAX_PER_DAY) &&
-        (!MISTRAL_API_KEY || mistralCallsToday >= MISTRAL_MAX_PER_DAY) &&
+        (!GEMINI_API_KEY || geminiRewriteCallsToday >= GEMINI_REWRITE_MAX_PER_DAY) &&
+        (!GROQ_API_KEY || groqRewriteCallsToday >= GROQ_REWRITE_MAX_PER_DAY) &&
+        (!MISTRAL_API_KEY || mistralRewriteCallsToday >= MISTRAL_REWRITE_MAX_PER_DAY) &&
         (!CEREBRAS_API_KEY || cerebrasCallsToday >= CEREBRAS_MAX_PER_DAY) &&
         (!COHERE_API_KEY || cohereCallsToday >= COHERE_MAX_PER_DAY);
       if (noProviderLeft) {
@@ -1779,9 +1808,9 @@ async function fetchAllNews() {
 
   console.log(`\n📊 SUMMARY: +${totalNew} new articles this cycle`);
   console.log(`   Gemini key configured: ${GEMINI_API_KEY ? 'YES' : 'NO — set GEMINI_API_KEY in Render, nothing will publish without it'}`);
-  console.log(`   Gemini calls used today: ${geminiCallsToday}/${GEMINI_MAX_PER_DAY}`);
-  console.log(`   Groq key configured: ${GROQ_API_KEY ? 'YES' : 'NO'} — Groq calls used today: ${groqCallsToday}/${GROQ_MAX_PER_DAY}`);
-  console.log(`   Mistral key configured: ${MISTRAL_API_KEY ? 'YES' : 'NO'} — Mistral calls used today: ${mistralCallsToday}/${MISTRAL_MAX_PER_DAY}`);
+  console.log(`   Gemini — rewrite: ${geminiRewriteCallsToday}/${GEMINI_REWRITE_MAX_PER_DAY}, translate: ${geminiTranslateCallsToday}/${GEMINI_TRANSLATE_MAX_PER_DAY}`);
+  console.log(`   Groq key configured: ${GROQ_API_KEY ? 'YES' : 'NO'} — rewrite: ${groqRewriteCallsToday}/${GROQ_REWRITE_MAX_PER_DAY}, translate: ${groqTranslateCallsToday}/${GROQ_TRANSLATE_MAX_PER_DAY}`);
+  console.log(`   Mistral key configured: ${MISTRAL_API_KEY ? 'YES' : 'NO'} — rewrite: ${mistralRewriteCallsToday}/${MISTRAL_REWRITE_MAX_PER_DAY}, translate: ${mistralTranslateCallsToday}/${MISTRAL_TRANSLATE_MAX_PER_DAY}`);
   console.log(`   Cerebras key configured: ${CEREBRAS_API_KEY ? 'YES' : 'NO'} — Cerebras calls used today: ${cerebrasCallsToday}/${CEREBRAS_MAX_PER_DAY}`);
   console.log(`   Cohere key configured: ${COHERE_API_KEY ? 'YES' : 'NO'} — Cohere calls used today: ${cohereCallsToday}/${COHERE_MAX_PER_DAY}`);
   console.log(`✅ Fetch completed at ${new Date().toLocaleTimeString()}\n`);
