@@ -234,7 +234,7 @@ app.get('/render/home', async (req, res) => {
 </head>
 <body>
 <h1>Newzyy — Top World News</h1>
-<p>Newzyy is an independent news outlet covering politics, technology, AI, business, sports, health, science, culture, travel, environment, and world affairs.</p>
+<p>Newzyy is an independent news outlet covering politics, technology, AI, business, sports, health, science, culture, environment, and world affairs.</p>
 <nav>
 ${items.length ? '' : '<p>No articles available right now — please check back shortly.</p>'}
 </nav>
