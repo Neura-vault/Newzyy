@@ -868,7 +868,7 @@ app.get('/api/all-news', async (req, res) => {
     const page = Math.max(1, parseInt(req.query.page) || 1);
     const limit = Math.min(100, parseInt(req.query.limit) || 20);
     const filter = { status: 'published' };
-    if (req.query.category) filter.category = req.query.category;
+    if (req.query.category && CATEGORIES.includes(String(req.query.category))) filter.category = String(req.query.category);
     const lang = LANGUAGES[req.query.lang] ? req.query.lang : null;
     // Only show articles that actually HAVE this translation — no English fallback mixed in.
     if (lang) filter[`translations.${lang}`] = { $exists: true };
@@ -943,13 +943,21 @@ app.get('/api/search', async (req, res) => {
     const q = (req.query.q || '').trim();
     if (q.length < 2) return res.json({ success: true, news: [] });
 
+    const lang = LANGUAGES[req.query.lang] ? req.query.lang : null;
     const regex = new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
+
+    const orClauses = [{ title: regex }, { excerpt: regex }, { category: regex }];
+    if (lang) {
+      orClauses.push({ [`translations.${lang}.title`]: regex });
+      orClauses.push({ [`translations.${lang}.excerpt`]: regex });
+    }
+
     const articles = await Article.find({
       status: 'published',
-      $or: [{ title: regex }, { excerpt: regex }, { category: regex }]
+      $or: orClauses
     }).sort({ fetched_at: -1 }).limit(30).lean();
 
-    res.json({ success: true, news: attachLiveFields(articles) });
+    res.json({ success: true, news: applyLanguageToList(attachLiveFields(articles), lang) });
   } catch (e) {
     console.error('search error:', e.message);
     res.json({ success: true, news: [] });
@@ -1158,6 +1166,27 @@ async function fetchCategorySources(cat) {
 const MIN_IMAGE_WIDTH = 300;
 const MIN_IMAGE_HEIGHT = 180;
 const MIN_IMAGE_BYTES = 4000; // filters out tiny placeholder/broken-icon images
+
+// ========== SENSITIVE CONTENT FILTER ==========
+// This pipeline auto-publishes with no human editorial review in the loop.
+// Sexual-offence court reporting carries real legal risk without one —
+// contempt of court on active trials, complainant-identification laws, and
+// defamation exposure if any AI-rewritten detail drifts from the source.
+// Safest approach here is to skip these stories from auto-publish entirely
+// rather than risk publishing an unreviewed account of one. This is
+// intentionally narrow (sexual-offence / abuse cases specifically) — it
+// does not block general crime, court, or legal-affairs reporting, which
+// carries much lower risk and is legitimate news coverage.
+const SENSITIVE_KEYWORDS = [
+  'sexual assault', 'sexually assault', 'indecent assault', 'sexual abuse',
+  'sexually abused', 'child abuse', 'child sexual', 'rape', 'raped', 'rapist',
+  'molest', 'pedophile', 'paedophile', 'grooming', 'sex offender',
+  'sex abuse', 'incest', 'complainant', 'victim testimony'
+];
+function isSensitiveContent(article) {
+  const text = `${article.title || ''} ${article.description || ''}`.toLowerCase();
+  return SENSITIVE_KEYWORDS.some(kw => text.includes(kw));
+}
 
 async function isGoodImage(url) {
   if (!url) return false;
@@ -1687,7 +1716,7 @@ async function fetchAllNews() {
   // Every category gets a turn before any category gets a second turn, so if
   // the Gemini budget runs out mid-cycle, every category already had a fair share.
   const stats = {};
-  CATEGORIES.forEach(c => (stats[c] = { added: 0, skippedImage: 0, skippedGemini: 0 }));
+  CATEGORIES.forEach(c => (stats[c] = { added: 0, skippedImage: 0, skippedGemini: 0, skippedSensitive: 0 }));
 
   let totalNew = 0;
   let round = 0;
@@ -1703,6 +1732,12 @@ async function fetchAllNews() {
       const article = list[round];
       const titleLower = article.title.toLowerCase();
       if (existingTitles.has(titleLower)) continue; // could have been added by an earlier round this same cycle
+
+      // ----- Sensitive content check (cheapest check, do it first) -----
+      if (isSensitiveContent(article)) {
+        stats[cat].skippedSensitive++;
+        continue;
+      }
 
       // ----- Image check first (cheap, saves wasting a Gemini call on articles we'd reject anyway) -----
       const hasGoodImage = await isGoodImage(article.image);
@@ -1791,7 +1826,7 @@ async function fetchAllNews() {
 
   CATEGORIES.forEach(cat => {
     const s = stats[cat];
-    console.log(`   ✅ ${cat}: ${s.added} added, ${s.skippedImage} skipped (bad/missing image), ${s.skippedGemini} skipped (rewrite/quota)`);
+    console.log(`   ✅ ${cat}: ${s.added} added, ${s.skippedImage} skipped (bad/missing image), ${s.skippedGemini} skipped (rewrite/quota), ${s.skippedSensitive} skipped (sensitive content)`);
   });
 
   // Retention: 90 days, not 3 — permanent-ish URLs matter for SEO and social shares.
