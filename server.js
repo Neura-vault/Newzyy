@@ -47,7 +47,7 @@ const VERIFICATION_CODE_TTL_MIN = 15;
 // defaults (its own error says "limit: 20"). Rather than guess a fixed pace, we read
 // Google's own suggested wait time from each 429 response and back off exactly that
 // long — self-adjusting to whatever the real limit is, never guessing wrong.
-const GEMINI_DELAY_MS = 6000;              // base spacing between successful calls
+const GEMINI_DELAY_MS = 4500;              // base spacing between successful calls (tightened from 6000 for faster throughput; 429 backoff still self-corrects if this is too aggressive)
 // Split so a busy rewrite cycle can never starve translation of quota (and vice
 // versa) — translation gets the bigger share since one article needs 9 translation
 // calls (one per language) but only 1 rewrite call.
@@ -1676,7 +1676,7 @@ async function runTranslationCycle() {
           );
           succeeded++;
         }
-        await new Promise(r => setTimeout(r, 2500));
+        await new Promise(r => setTimeout(r, 2000));
       }
     }
   } catch (e) {
@@ -1766,7 +1766,7 @@ async function fetchAllNews() {
         continue;
       }
 
-      await new Promise(r => setTimeout(r, result.provider === 'groq' ? 2500 : GEMINI_DELAY_MS));
+      await new Promise(r => setTimeout(r, result.provider === 'groq' ? 2000 : GEMINI_DELAY_MS));
 
       // ----- Translate into every active language IN PARALLEL before publishing -----
       // Nothing goes live (not even English) until every language succeeds. If any
@@ -1945,21 +1945,22 @@ mongoose.connection.once('open', () => {
   setInterval(async () => {
     console.log('⏰ Scheduled news fetch...');
     await fetchAllNews().catch(console.error);
-  }, 6 * 60 * 60 * 1000);
+  }, 30 * 60 * 1000); // tightened from every 6h to every 30min for fresher news
 
   // Newsletter digest — once every 24 hours.
   setInterval(async () => {
     await sendDailyDigest().catch(console.error);
   }, 24 * 60 * 60 * 1000);
 
-  // Translation cycle — every 2 hours, starting 20 minutes after boot so it
-  // doesn't compete with the initial news fetch for AI quota at the same instant.
+  // Translation cycle — every 30 minutes (tightened from every 2h), starting 5
+  // minutes after boot so it doesn't compete with the initial news fetch for
+  // AI quota at the same instant.
   setTimeout(() => {
     runTranslationCycle().catch(console.error);
     setInterval(async () => {
       await runTranslationCycle().catch(console.error);
-    }, 2 * 60 * 60 * 1000);
-  }, 20 * 60 * 1000);
+    }, 30 * 60 * 1000);
+  }, 5 * 60 * 1000);
 });
 
 // ========== START SERVER ==========
