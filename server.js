@@ -1,5 +1,5 @@
 // ════════════════════════════════════════════════════════════
-//  NEWZYY — Guardian + diverse RSS sources, per category
+//  NEWZYY — RSS sources, per category
 //  v2.1 — MongoDB storage, Gemini rewrite, fair round-robin
 // ════════════════════════════════════════════════════════════
 
@@ -38,8 +38,25 @@ const PORT = process.env.PORT || 3001;
 const SITE_URL = process.env.SITE_URL || 'https://newzyy.site';
 
 // ========== API KEYS ==========
-const GUARDIAN_API_KEY = process.env.GUARDIAN_API_KEY || 'ab35f734-ceb0-4a49-bb7d-24c0c3331bd6';
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY; // set this in Render → Environment
+// Gemini now supports up to 5 keys, round-robin rotated — set GEMINI_API_KEY,
+// GEMINI_API_KEY_2, GEMINI_API_KEY_3, GEMINI_API_KEY_4, GEMINI_API_KEY_5 in
+// Render → Environment. Unset ones are simply skipped, so this still works
+// fine with just 1 key configured — nothing else needs to change either way.
+const GEMINI_API_KEYS = [
+  process.env.GEMINI_API_KEY,
+  process.env.GEMINI_API_KEY_2,
+  process.env.GEMINI_API_KEY_3,
+  process.env.GEMINI_API_KEY_4,
+  process.env.GEMINI_API_KEY_5
+].filter(Boolean);
+let geminiKeyRotationIndex = 0;
+// Picks the next key in the pool, round-robin — spreads calls evenly across
+// every configured key instead of hammering just the first one.
+function nextGeminiKey() {
+  const key = GEMINI_API_KEYS[geminiKeyRotationIndex % GEMINI_API_KEYS.length];
+  geminiKeyRotationIndex++;
+  return key;
+}
 const JWT_SECRET = process.env.JWT_SECRET; // set this in Render → Environment — long random string
 const VERIFICATION_CODE_TTL_MIN = 15;
 
@@ -51,8 +68,11 @@ const GEMINI_DELAY_MS = 4500;              // base spacing between successful ca
 // Split so a busy rewrite cycle can never starve translation of quota (and vice
 // versa) — translation gets the bigger share since one article needs 9 translation
 // calls (one per language) but only 1 rewrite call.
-const GEMINI_REWRITE_MAX_PER_DAY = 360;
-const GEMINI_TRANSLATE_MAX_PER_DAY = 840;
+// Per-key daily budget stays the same as before (360 / 840) — these totals just
+// multiply by however many Gemini keys are actually configured (1 to 5), so
+// nothing else in the file needs to know how many keys there are.
+const GEMINI_REWRITE_MAX_PER_DAY = 360 * Math.max(GEMINI_API_KEYS.length, 1);
+const GEMINI_TRANSLATE_MAX_PER_DAY = 840 * Math.max(GEMINI_API_KEYS.length, 1);
 const GEMINI_MAX_ROUNDS_PER_CYCLE = 20;    // cap how many articles per category one cycle will attempt
 let geminiRewriteCallsToday = 0;
 let geminiTranslateCallsToday = 0;
@@ -163,7 +183,7 @@ function requireAuth(req, res, next) {
 
 // ========== HEALTH CHECK ==========
 app.get('/', (req, res) => {
-  res.json({ status: 'ok', service: 'Newzyy (Guardian + diverse RSS, MongoDB, Auth)', time: new Date().toISOString() });
+  res.json({ status: 'ok', service: 'Newzyy (RSS, MongoDB, Auth)', time: new Date().toISOString() });
 });
 
 // ════════════════════════════════════════════════════════════
@@ -662,7 +682,8 @@ app.get('/api/admin/stats', async (req, res) => {
       perCategory,
       ai: {
         gemini: {
-          configured: Boolean(GEMINI_API_KEY),
+          configured: GEMINI_API_KEYS.length > 0,
+          keysConfigured: GEMINI_API_KEYS.length,
           rewrite: { callsToday: geminiRewriteCallsToday, maxPerDay: GEMINI_REWRITE_MAX_PER_DAY },
           translate: { callsToday: geminiTranslateCallsToday, maxPerDay: GEMINI_TRANSLATE_MAX_PER_DAY }
         },
@@ -766,31 +787,8 @@ const CATEGORIES = [
   'science', 'entertainment', 'travel', 'environment', 'culture', 'world', 'economy'
 ];
 
-// Every category has its OWN dedicated Guardian query (never shares another
-// category's results) — either a specific section, or a free-text search when
-// no matching section exists. This is the primary source for every category.
-// FIX: ai / economy / entertainment must be `search`, not `section` — Guardian
-// "sections" are fixed single-word slugs (politics, sport, world...), not phrases
-// or boolean OR queries. Using `section` for those silently returns zero results.
-const GUARDIAN_CATEGORY_QUERY = {
-  politics: { section: 'politics' },
-  world: { section: 'world' },
-  technology: { section: 'technology' },
-  ai: { search: 'artificial intelligence' },
-  business: { section: 'business' },
-  economy: { search: 'economy OR economic OR inflation OR "interest rates"' },
-  health: { section: 'health' },
-  science: { section: 'science' },
-  environment: { section: 'environment' },
-  sports: { section: 'sport' },
-  entertainment: { search: 'entertainment OR celebrity OR film OR music OR television' },
-  culture: { section: 'culture' },
-  travel: { section: 'travel' }
-};
-
-// Secondary source for extra volume — official RSS feeds, one per category,
-// no API key needed. Only categories with a real matching feed are listed;
-// the rest rely on Guardian alone, which is enough on its own.
+// Every category has its own dedicated RSS feed — this is now the sole source
+// for every category (Guardian API removed).
 const RSS_FEEDS = {
   politics: 'https://feeds.bbci.co.uk/news/politics/rss.xml',
   world: 'https://feeds.bbci.co.uk/news/world/rss.xml',
@@ -1061,58 +1059,7 @@ function stripHtml(html) {
     .trim();
 }
 
-// ========== SOURCE 1: GUARDIAN (dedicated query per category) ==========
-async function fetchGuardianForCategory(cat) {
-  if (!GUARDIAN_API_KEY) return [];
-  const q = GUARDIAN_CATEGORY_QUERY[cat];
-  if (!q) return [];
-
-  const base = q.section
-    ? `section=${encodeURIComponent(q.section)}`
-    : `q=${encodeURIComponent(q.search)}`;
-  const url = `https://content.guardianapis.com/search?${base}&api-key=${GUARDIAN_API_KEY}&show-fields=body,thumbnail,trailText&show-elements=image&page-size=15&order-by=newest`;
-
-  try {
-    const response = await fetch(url);
-    const data = await response.json();
-    if (!data.response || !data.response.results) return [];
-
-    return data.response.results.map(a => {
-      // Guardian's fields.thumbnail is a tiny ~140x84 crop — too small to display well.
-      // The `elements` array (from show-elements=image) carries the real, full-size
-      // picture with multiple asset sizes. Pick the largest available one instead.
-      let image = a.fields?.thumbnail || '';
-      try {
-        const imageElement = (a.elements || []).find(el => el.type === 'image');
-        const assets = imageElement?.assets || [];
-        if (assets.length) {
-          const largest = assets.reduce((best, cur) => {
-            const w = parseInt(cur.typeData?.width) || 0;
-            const bw = parseInt(best?.typeData?.width) || 0;
-            return w > bw ? cur : best;
-          }, assets[0]);
-          if (largest?.file) image = largest.file;
-        }
-      } catch (e) { /* fall back to thumbnail — never fatal */ }
-
-      return {
-        title: a.webTitle || a.fields?.headline || 'Untitled',
-        description: stripHtml(a.fields?.trailText || ''),
-        body: stripHtml(a.fields?.body || ''),
-        url: a.webUrl || a.url,
-        image,
-        author: a.fields?.byline || a.sectionName || 'The Guardian',
-        publishedAt: a.webPublicationDate || new Date().toISOString(),
-        source: 'The Guardian'
-      };
-    });
-  } catch (e) {
-    console.error(`   ⚠️ Guardian fetch failed for ${cat}:`, e.message);
-    return []; // never throw — an empty array just means this source contributed nothing this cycle
-  }
-}
-
-// ========== SOURCE 2: RSS (dedicated feed per category, no key needed) ==========
+// ========== SOURCE: RSS (dedicated feed per category, no key needed) ==========
 async function fetchRSS(cat) {
   const feedUrl = RSS_FEEDS[cat];
   if (!feedUrl) return [];
@@ -1143,19 +1090,15 @@ async function fetchRSS(cat) {
     });
   } catch (e) {
     console.error(`   ⚠️ RSS fetch failed for ${cat}:`, e.message);
-    return []; // never throw — this category just falls back to Guardian-only this cycle
+    return []; // never throw — this category simply contributes nothing this cycle
   }
 }
 
-// ========== COMBINE BOTH SOURCES FOR ONE CATEGORY ==========
-// Each category is fully independent — a failure in one source, or one category,
-// can never affect any other category.
+// ========== FETCH ARTICLES FOR ONE CATEGORY (RSS only) ==========
+// Each category is fully independent — a failure in one category can never
+// affect any other category.
 async function fetchCategorySources(cat) {
-  const [guardianArticles, Articles] = await Promise.all([
-    fetchGuardianForCategory(cat),
-    fetchRSS(cat)
-  ]);
-  return [...guardianArticles, ...Articles];
+  return await fetchRSS(cat);
 }
 
 // ========== IMAGE VALIDATION ==========
@@ -1218,7 +1161,7 @@ async function isGoodImage(url) {
 // original Newzyy article from them. Returns null text on any failure so the
 // caller can skip publishing (never breaks the pipeline).
 async function rewriteWithGemini(rawArticle, category) {
-  if (!GEMINI_API_KEY) return { text: null, retryAfterMs: 0 };
+  if (GEMINI_API_KEYS.length === 0) return { text: null, retryAfterMs: 0 };
 
   const sourceFacts = (rawArticle.body || rawArticle.description || '').substring(0, 3000);
   if (!sourceFacts.trim()) return { text: null, retryAfterMs: 0 };
@@ -1236,7 +1179,7 @@ ${sourceFacts}`;
 
   try {
     const res = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${nextGeminiKey()}`,
       {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -1474,7 +1417,7 @@ async function rewriteArticle(rawArticle, category) {
   checkCerebrasDayReset();
   checkCohereDayReset();
 
-  if (GEMINI_API_KEY && geminiRewriteCallsToday < GEMINI_REWRITE_MAX_PER_DAY) {
+  if (GEMINI_API_KEYS.length > 0 && geminiRewriteCallsToday < GEMINI_REWRITE_MAX_PER_DAY) {
     const result = await rewriteWithGemini(rawArticle, category);
     geminiRewriteCallsToday++;
     if (result.text) return { ...result, provider: 'gemini' };
@@ -1568,10 +1511,10 @@ Body: ${(article.body || '').substring(0, 3000)}`;
 }
 
 async function translateWithGemini(article, langCode) {
-  if (!GEMINI_API_KEY) return null;
+  if (GEMINI_API_KEYS.length === 0) return null;
   try {
     const res = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${nextGeminiKey()}`,
       {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -1633,7 +1576,7 @@ async function translateArticle(article, langCode) {
   checkGroqDayReset();
   checkMistralDayReset();
 
-  if (GEMINI_API_KEY && geminiTranslateCallsToday < GEMINI_TRANSLATE_MAX_PER_DAY) {
+  if (GEMINI_API_KEYS.length > 0 && geminiTranslateCallsToday < GEMINI_TRANSLATE_MAX_PER_DAY) {
     geminiTranslateCallsToday++;
     const result = await translateWithGemini(article, langCode);
     if (result) return result;
@@ -1688,7 +1631,7 @@ async function runTranslationCycle() {
 
 // ========== MAIN FETCH FUNCTION (MongoDB, fair round-robin across all categories) ==========
 async function fetchAllNews() {
-  console.log(`\n🔄 [${new Date().toLocaleTimeString()}] Starting news fetch (Guardian + diverse RSS, per category)...`);
+  console.log(`\n🔄 [${new Date().toLocaleTimeString()}] Starting news fetch (RSS, per category)...`);
   checkGeminiDayReset();
 
   // Load existing titles once, so we don't hit the DB per-article inside the loop.
@@ -1748,7 +1691,7 @@ async function fetchAllNews() {
 
       // ----- AI rewrite: Gemini → Groq → Mistral → Cerebras → Cohere -----
       const noProviderLeft =
-        (!GEMINI_API_KEY || geminiRewriteCallsToday >= GEMINI_REWRITE_MAX_PER_DAY) &&
+        (GEMINI_API_KEYS.length === 0 || geminiRewriteCallsToday >= GEMINI_REWRITE_MAX_PER_DAY) &&
         (!GROQ_API_KEY || groqRewriteCallsToday >= GROQ_REWRITE_MAX_PER_DAY) &&
         (!MISTRAL_API_KEY || mistralRewriteCallsToday >= MISTRAL_REWRITE_MAX_PER_DAY) &&
         (!CEREBRAS_API_KEY || cerebrasCallsToday >= CEREBRAS_MAX_PER_DAY) &&
@@ -1842,7 +1785,7 @@ async function fetchAllNews() {
   }
 
   console.log(`\n📊 SUMMARY: +${totalNew} new articles this cycle`);
-  console.log(`   Gemini key configured: ${GEMINI_API_KEY ? 'YES' : 'NO — set GEMINI_API_KEY in Render, nothing will publish without it'}`);
+  console.log(`   Gemini keys configured: ${GEMINI_API_KEYS.length > 0 ? GEMINI_API_KEYS.length : 'NONE — set GEMINI_API_KEY in Render, nothing will publish without it'}`);
   console.log(`   Gemini — rewrite: ${geminiRewriteCallsToday}/${GEMINI_REWRITE_MAX_PER_DAY}, translate: ${geminiTranslateCallsToday}/${GEMINI_TRANSLATE_MAX_PER_DAY}`);
   console.log(`   Groq key configured: ${GROQ_API_KEY ? 'YES' : 'NO'} — rewrite: ${groqRewriteCallsToday}/${GROQ_REWRITE_MAX_PER_DAY}, translate: ${groqTranslateCallsToday}/${GROQ_TRANSLATE_MAX_PER_DAY}`);
   console.log(`   Mistral key configured: ${MISTRAL_API_KEY ? 'YES' : 'NO'} — rewrite: ${mistralRewriteCallsToday}/${MISTRAL_REWRITE_MAX_PER_DAY}, translate: ${mistralTranslateCallsToday}/${MISTRAL_TRANSLATE_MAX_PER_DAY}`);
@@ -1939,7 +1882,7 @@ app.get('/api/admin/translation-coverage', async (req, res) => {
 
 // ========== START SCHEDULE ==========
 mongoose.connection.once('open', () => {
-  console.log('📰 Initializing news fetcher (Guardian + diverse RSS, dedicated per category, Gemini rewrite)...');
+  console.log('📰 Initializing news fetcher (RSS, dedicated per category, Gemini rewrite)...');
   fetchAllNews().catch(console.error);
 
   setInterval(async () => {
@@ -1966,7 +1909,7 @@ mongoose.connection.once('open', () => {
 // ========== START SERVER ==========
 app.listen(PORT, () => {
   console.log(`\n🚀 Server running on port ${PORT}`);
-  console.log(`   🔥 Guardian + diverse RSS per category, Gemini-rewritten, MongoDB storage`);
+  console.log(`   🔥 RSS per category, Gemini-rewritten, MongoDB storage`);
   console.log(`   GET  /api/all-news?page=1&limit=20&category=technology`);
   console.log(`   GET  /api/article/:id`);
   console.log(`   GET  /api/category/:slug`);
