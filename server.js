@@ -1337,16 +1337,50 @@ async function isGoodImage(url) {
 
 // ========== AI-GENERATED ARTICLE IMAGES ==========
 // The pipeline no longer uses the image (if any) that came with the source
-// RSS item — most RSS feeds don't reliably include one, which was causing
-// almost every article to get skipped as "bad image". Instead, every article
-// gets a purpose-made image: Gemini generates it from the headline/category,
-// then it's uploaded to Cloudinary so MongoDB only ever stores a URL (same as
-// before), not the image bytes themselves.
+// RSS item — most RSS feeds don't reliably include one. Instead, every
+// article gets a purpose-made image: Gemini generates it from the
+// headline/category, then it's uploaded to Cloudinary so MongoDB only ever
+// stores a URL (same as before), not the image bytes themselves.
+//
+// IMPORTANT: image generation is treated as a bonus, never a gate. Google's
+// quota applies per PROJECT, not per key, so 5 keys don't necessarily mean 5x
+// image budget — it can run out well before rewrite/translate quota does. If
+// it does, the article still publishes, just with the fallback card below
+// instead of an AI image, rather than being skipped entirely.
+
+// Spread image-gen attempts across the day's cycles instead of trying to
+// generate images for every single article in the very first cycle (which is
+// what was silently exhausting the daily quota within 1-2 hours). Reset once
+// per fetchAllNews() run.
+const GEMINI_IMAGE_MAX_PER_CYCLE = 15;
+let geminiImageCallsThisCycle = 0;
+
+// Deterministic, on-brand color per category so the same category always
+// looks the same. No API call, no cost, cannot fail — this is what publishes
+// when AI image generation isn't available (quota, error, etc.).
+const CATEGORY_FALLBACK_COLOR = {
+  politics: '#7c2d12', technology: '#1e3a8a', ai: '#312e81', sports: '#166534',
+  business: '#78350f', health: '#831843', science: '#164e63', entertainment: '#701a75',
+  travel: '#0e7490', environment: '#14532d', culture: '#9a3412', world: '#1e293b', economy: '#713f12'
+};
+function buildFallbackImage(category) {
+  const bg = CATEGORY_FALLBACK_COLOR[category] || '#1f2937';
+  const label = category.toUpperCase();
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630">
+    <rect width="1200" height="630" fill="${bg}"/>
+    <text x="600" y="345" font-family="Georgia, serif" font-size="56" font-weight="700" fill="#ffffff" text-anchor="middle" opacity="0.92">${label}</text>
+    <text x="600" y="405" font-family="Arial, sans-serif" font-size="26" letter-spacing="6" fill="#ffffff" text-anchor="middle" opacity="0.6">NEWZYY</text>
+  </svg>`;
+  return `data:image/svg+xml;base64,${Buffer.from(svg).toString('base64')}`;
+}
 
 async function generateImageWithGemini(title, category, contextText) {
   checkGeminiDayReset();
-  if (GEMINI_API_KEYS.length === 0 || geminiImageCallsToday >= GEMINI_IMAGE_MAX_PER_DAY) return null;
+  if (GEMINI_API_KEYS.length === 0) return null;
+  if (geminiImageCallsToday >= GEMINI_IMAGE_MAX_PER_DAY) return null;
+  if (geminiImageCallsThisCycle >= GEMINI_IMAGE_MAX_PER_CYCLE) return null; // saves the rest of today's quota for later cycles
   geminiImageCallsToday++;
+  geminiImageCallsThisCycle++;
 
   const prompt = `Create a clean, professional editorial news photograph that visually represents this news story — the kind of photo that would run alongside a real news article.
 
@@ -1370,7 +1404,7 @@ Style requirements: realistic photojournalism style, wide/landscape composition,
     );
     const data = await res.json();
     if (!res.ok || data.error) {
-      console.error('   ⚠️ Gemini image generation failed:', data.error?.message || res.status);
+      console.error('   ⚠️ Gemini image generation failed (falling back to placeholder):', data.error?.message || res.status);
       return null;
     }
     const parts = data?.candidates?.[0]?.content?.parts || [];
@@ -1379,7 +1413,7 @@ Style requirements: realistic photojournalism style, wide/landscape composition,
     if (!inline?.data) return null;
     return { base64: inline.data, mimeType: inline.mimeType || inline.mime_type || 'image/png' };
   } catch (e) {
-    console.error('   ⚠️ Gemini image generation error:', e.message);
+    console.error('   ⚠️ Gemini image generation error (falling back to placeholder):', e.message);
     return null;
   }
 }
@@ -1401,24 +1435,27 @@ async function uploadImageToCloudinary(base64Data, mimeType) {
     });
     const data = await res.json();
     if (!res.ok || !data.secure_url) {
-      console.error('   ⚠️ Cloudinary upload failed:', data.error?.message || 'unknown error');
+      console.error('   ⚠️ Cloudinary upload failed (falling back to placeholder):', data.error?.message || 'unknown error');
       return null;
     }
     return data.secure_url;
   } catch (e) {
-    console.error('   ⚠️ Cloudinary upload error:', e.message);
+    console.error('   ⚠️ Cloudinary upload error (falling back to placeholder):', e.message);
     return null;
   }
 }
 
-// Combines the two steps above — this is what the fetch pipeline actually
-// calls. Returns a hosted URL on success, or null if either step failed (in
-// which case the caller skips the article this cycle and retries next time,
-// same as the old "bad image" skip used to work).
+// Combines the two steps above. ALWAYS returns a usable image URL — either
+// the real AI-generated one, or the zero-cost fallback card if generation or
+// upload failed for any reason. Never returns null, so this can never block
+// an article from publishing.
 async function generateAndHostArticleImage(title, category, contextText) {
   const generated = await generateImageWithGemini(title, category, contextText);
-  if (!generated) return null;
-  return await uploadImageToCloudinary(generated.base64, generated.mimeType);
+  if (generated) {
+    const hostedUrl = await uploadImageToCloudinary(generated.base64, generated.mimeType);
+    if (hostedUrl) return { url: hostedUrl, aiGenerated: true };
+  }
+  return { url: buildFallbackImage(category), aiGenerated: false };
 }
 
 // ========== GEMINI REWRITE ==========
@@ -1899,6 +1936,7 @@ async function runTranslationCycle() {
 async function fetchAllNews() {
   console.log(`\n🔄 [${new Date().toLocaleTimeString()}] Starting news fetch (RSS, per category)...`);
   checkGeminiDayReset();
+  geminiImageCallsThisCycle = 0; // fresh budget for this cycle's image generation
 
   // Load existing titles once, so we don't hit the DB per-article inside the loop.
   let existingTitles;
@@ -1925,7 +1963,7 @@ async function fetchAllNews() {
   // Every category gets a turn before any category gets a second turn, so if
   // the Gemini budget runs out mid-cycle, every category already had a fair share.
   const stats = {};
-  CATEGORIES.forEach(c => (stats[c] = { added: 0, skippedImage: 0, skippedGemini: 0, skippedSensitive: 0 }));
+  CATEGORIES.forEach(c => (stats[c] = { added: 0, aiImage: 0, fallbackImage: 0, skippedGemini: 0, skippedSensitive: 0 }));
 
   let totalNew = 0;
   let round = 0;
@@ -1994,14 +2032,10 @@ async function fetchAllNews() {
         continue;
       }
 
-      // ----- Generate the article's image now — only for articles that are
-      // actually about to be published, so we don't waste image-generation
-      // quota / Cloudinary uploads on anything that got skipped above. -----
-      const generatedImage = await generateAndHostArticleImage(article.title, cat, englishDraft.excerpt);
-      if (!generatedImage) {
-        stats[cat].skippedImage++; // will retry next cycle, same as before
-        continue;
-      }
+      // ----- Get the article's image — AI-generated if quota allows, a clean
+      // fallback card otherwise. This never fails and never blocks publishing. -----
+      const { url: imageUrl, aiGenerated } = await generateAndHostArticleImage(article.title, cat, englishDraft.excerpt);
+      if (aiGenerated) stats[cat].aiImage++; else stats[cat].fallbackImage++;
 
       try {
         await Article.create({
@@ -2013,7 +2047,7 @@ async function fetchAllNews() {
           author: 'Newzyy Staff',
           views: Math.floor(Math.random() * 5000) + 100,
           comments: Math.floor(Math.random() * 200),
-          image: generatedImage,
+          image: imageUrl,
           imageAlt: article.title,
           status: 'published',
           // Kept internally for editorial record-keeping only — not shown on the site.
@@ -2037,7 +2071,7 @@ async function fetchAllNews() {
 
   CATEGORIES.forEach(cat => {
     const s = stats[cat];
-    console.log(`   ✅ ${cat}: ${s.added} added, ${s.skippedImage} skipped (image generation failed), ${s.skippedGemini} skipped (rewrite/quota), ${s.skippedSensitive} skipped (sensitive content)`);
+    console.log(`   ✅ ${cat}: ${s.added} added (${s.aiImage} AI image, ${s.fallbackImage} fallback image), ${s.skippedGemini} skipped (rewrite/quota), ${s.skippedSensitive} skipped (sensitive content)`);
   });
 
   // Retention: 90 days, not 3 — permanent-ish URLs matter for SEO and social shares.
