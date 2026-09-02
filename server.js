@@ -746,6 +746,169 @@ app.patch('/api/admin/article/:id/toggle-breaking', async (req, res) => {
   }
 });
 
+// ----- Manually written articles (admin panel "Write Article" tab) -----
+// Everything else (RSS fetch → AI rewrite → auto-translate → publish) keeps
+// running exactly as before; this is a second, independent way for a human to
+// add an article directly, using the same Article model and the same
+// translation pipeline the automated system already uses, so manual articles
+// look and behave identically to auto-published ones on the site.
+app.post('/api/admin/article/manual', async (req, res) => {
+  if (!ADMIN_SECRET) return res.status(500).json({ success: false, message: 'ADMIN_SECRET not set on server' });
+  if (req.query.secret !== ADMIN_SECRET) return res.status(403).json({ success: false, message: 'Wrong secret' });
+  try {
+    const { title, category, excerpt, body, image, author, autoTranslate, manualBreaking } = req.body || {};
+
+    if (!title || !title.trim()) return res.status(400).json({ success: false, message: 'Title is required.' });
+    if (!body || !body.trim()) return res.status(400).json({ success: false, message: 'Body is required.' });
+    if (!category || !CATEGORIES.includes(category)) {
+      return res.status(400).json({ success: false, message: `Category must be one of: ${CATEGORIES.join(', ')}` });
+    }
+
+    // Body typed in the admin textarea is plain text with blank lines between
+    // paragraphs — wrap each paragraph in <p> so it renders exactly like every
+    // other article on the site (which all store body as <p>-wrapped HTML).
+    const bodyHtml = body.trim().split(/\n\s*\n/).map(p => `<p>${p.trim().replace(/\n/g, ' ')}</p>`).join('');
+    const excerptText = (excerpt && excerpt.trim()) || body.trim().substring(0, 200);
+
+    let finalImage = (image || '').trim();
+    if (finalImage) {
+      const goodImage = await isGoodImage(finalImage);
+      if (!goodImage) {
+        return res.status(400).json({ success: false, message: 'Image URL could not be verified — check the link is a direct, public image URL (ends in .jpg/.png/etc, not a webpage).' });
+      }
+    }
+
+    // Auto-translate into every active language, same as the automated
+    // pipeline — optional, but on by default so the article shows correctly
+    // across all language pages instead of only the default one.
+    let translations = {};
+    if (autoTranslate !== false) {
+      const englishDraft = { title: title.trim(), excerpt: excerptText, body: bodyHtml };
+      const translationResults = await Promise.all(
+        ACTIVE_LANGUAGES.map(async langCode => ({ langCode, result: await translateArticle(englishDraft, langCode) }))
+      );
+      for (const { langCode, result: tResult } of translationResults) {
+        if (tResult) translations[langCode] = { ...tResult, translatedAt: new Date() };
+      }
+    }
+
+    const created = await Article.create({
+      id: `manual_${Date.now()}_${Math.random().toString(36).substring(2, 10)}`,
+      category,
+      title: title.trim(),
+      excerpt: excerptText,
+      body: bodyHtml,
+      author: (author && author.trim()) || 'Newzyy Staff',
+      views: 0,
+      comments: 0,
+      image: finalImage,
+      imageAlt: title.trim(),
+      status: 'published',
+      source: 'Newzyy (manual)',
+      rewritten: true,
+      manualBreaking: Boolean(manualBreaking),
+      translations,
+      fetched_at: new Date()
+    });
+
+    res.json({
+      success: true,
+      message: `Article published. ${Object.keys(translations).length}/${ACTIVE_LANGUAGES.length} languages translated.`,
+      article: created
+    });
+  } catch (e) {
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
+// ----- Edit an existing article (auto-published OR manual) -----
+// Previously only Delete existed for articles — no way to fix a typo or swap
+// a bad image without deleting and re-adding. Same fields as manual create;
+// leaving image/excerpt blank keeps the existing value. Retranslation is
+// opt-in (checkbox) so a small text fix doesn't burn AI quota by default.
+app.patch('/api/admin/article/:id', async (req, res) => {
+  if (!ADMIN_SECRET) return res.status(500).json({ success: false, message: 'ADMIN_SECRET not set on server' });
+  if (req.query.secret !== ADMIN_SECRET) return res.status(403).json({ success: false, message: 'Wrong secret' });
+  try {
+    const article = await Article.findOne({ id: req.params.id });
+    if (!article) return res.status(404).json({ success: false, message: 'Not found.' });
+
+    const { title, category, excerpt, body, image, author, manualBreaking, retranslate } = req.body || {};
+
+    if (category) {
+      if (!CATEGORIES.includes(category)) {
+        return res.status(400).json({ success: false, message: `Category must be one of: ${CATEGORIES.join(', ')}` });
+      }
+      article.category = category;
+    }
+    if (title && title.trim()) { article.title = title.trim(); article.imageAlt = title.trim(); }
+    if (typeof excerpt === 'string' && excerpt.trim()) article.excerpt = excerpt.trim();
+    if (typeof body === 'string' && body.trim()) {
+      article.body = body.trim().split(/\n\s*\n/).map(p => `<p>${p.trim().replace(/\n/g, ' ')}</p>`).join('');
+    }
+    if (typeof image === 'string' && image.trim()) {
+      const goodImage = await isGoodImage(image.trim());
+      if (!goodImage) {
+        return res.status(400).json({ success: false, message: 'Image URL could not be verified — check the link is a direct, public image URL.' });
+      }
+      article.image = image.trim();
+    }
+    if (typeof author === 'string' && author.trim()) article.author = author.trim();
+    if (typeof manualBreaking === 'boolean') article.manualBreaking = manualBreaking;
+
+    let translateMsg = '';
+    if (retranslate) {
+      const englishDraft = { title: article.title, excerpt: article.excerpt, body: article.body };
+      const translationResults = await Promise.all(
+        ACTIVE_LANGUAGES.map(async langCode => ({ langCode, result: await translateArticle(englishDraft, langCode) }))
+      );
+      const translations = { ...article.translations };
+      let filled = 0;
+      for (const { langCode, result: tResult } of translationResults) {
+        if (tResult) { translations[langCode] = { ...tResult, translatedAt: new Date() }; filled++; }
+      }
+      article.translations = translations;
+      translateMsg = ` Re-translated ${filled}/${ACTIVE_LANGUAGES.length} languages.`;
+    }
+
+    await article.save();
+    res.json({ success: true, message: `Article updated.${translateMsg}`, article });
+  } catch (e) {
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
+// ----- Fill in only the languages an article is still missing -----
+// Complements the "Translated X/9" badge already shown per article, which
+// previously had no action attached to it.
+app.post('/api/admin/article/:id/retranslate-missing', async (req, res) => {
+  if (!ADMIN_SECRET) return res.status(500).json({ success: false, message: 'ADMIN_SECRET not set on server' });
+  if (req.query.secret !== ADMIN_SECRET) return res.status(403).json({ success: false, message: 'Wrong secret' });
+  try {
+    const article = await Article.findOne({ id: req.params.id });
+    if (!article) return res.status(404).json({ success: false, message: 'Not found.' });
+
+    const have = new Set(Object.keys(article.translations || {}));
+    const missing = ACTIVE_LANGUAGES.filter(l => !have.has(l));
+    if (!missing.length) return res.json({ success: true, message: 'Already fully translated.', article });
+
+    const englishDraft = { title: article.title, excerpt: article.excerpt, body: article.body };
+    const translationResults = await Promise.all(
+      missing.map(async langCode => ({ langCode, result: await translateArticle(englishDraft, langCode) }))
+    );
+    const translations = { ...article.translations };
+    let filled = 0;
+    for (const { langCode, result: tResult } of translationResults) {
+      if (tResult) { translations[langCode] = { ...tResult, translatedAt: new Date() }; filled++; }
+    }
+    article.translations = translations;
+    await article.save();
+    res.json({ success: true, message: `Filled ${filled}/${missing.length} missing languages.`, article });
+  } catch (e) {
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
 // ----- Contact messages: mark read + delete -----
 app.patch('/api/admin/contact/:id/read', async (req, res) => {
   if (!ADMIN_SECRET) return res.status(500).json({ success: false, message: 'ADMIN_SECRET not set on server' });
