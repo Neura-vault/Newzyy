@@ -74,9 +74,24 @@ const GEMINI_DELAY_MS = 4500;              // base spacing between successful ca
 const GEMINI_REWRITE_MAX_PER_DAY = 360 * Math.max(GEMINI_API_KEYS.length, 1);
 const GEMINI_TRANSLATE_MAX_PER_DAY = 840 * Math.max(GEMINI_API_KEYS.length, 1);
 const GEMINI_MAX_ROUNDS_PER_CYCLE = 20;    // cap how many articles per category one cycle will attempt
+// Image generation quota is NOT multiplied by key count like rewrite/translate
+// above — Google's free-tier image quota is granted per Google Cloud project,
+// and multiple keys often share one project, so extra keys may not add extra
+// image headroom the way they do for text. Kept conservative (under the
+// documented ~500/day) so this never silently starts failing mid-cycle.
+const GEMINI_IMAGE_MAX_PER_DAY = 450;
 let geminiRewriteCallsToday = 0;
 let geminiTranslateCallsToday = 0;
+let geminiImageCallsToday = 0;
 let geminiDayStamp = new Date().toDateString();
+
+// ----- Cloudinary: hosts the AI-generated article images -----
+// Generated images come back from Gemini as base64 data, which we upload here
+// to get a permanent, public URL — keeps MongoDB documents small (just a URL,
+// like before) instead of storing image bytes directly in the database.
+const CLOUDINARY_CLOUD_NAME = process.env.CLOUDINARY_CLOUD_NAME;
+const CLOUDINARY_API_KEY = process.env.CLOUDINARY_API_KEY;
+const CLOUDINARY_API_SECRET = process.env.CLOUDINARY_API_SECRET;
 
 // ----- Groq: second AI provider (separate free account, separate quota) -----
 // Used as a fallback when Gemini's quota runs out — genuinely combines both
@@ -685,7 +700,8 @@ app.get('/api/admin/stats', async (req, res) => {
           configured: GEMINI_API_KEYS.length > 0,
           keysConfigured: GEMINI_API_KEYS.length,
           rewrite: { callsToday: geminiRewriteCallsToday, maxPerDay: GEMINI_REWRITE_MAX_PER_DAY },
-          translate: { callsToday: geminiTranslateCallsToday, maxPerDay: GEMINI_TRANSLATE_MAX_PER_DAY }
+          translate: { callsToday: geminiTranslateCallsToday, maxPerDay: GEMINI_TRANSLATE_MAX_PER_DAY },
+          image: { callsToday: geminiImageCallsToday, maxPerDay: GEMINI_IMAGE_MAX_PER_DAY }
         },
         groq: {
           configured: Boolean(GROQ_API_KEY),
@@ -1319,6 +1335,92 @@ async function isGoodImage(url) {
   }
 }
 
+// ========== AI-GENERATED ARTICLE IMAGES ==========
+// The pipeline no longer uses the image (if any) that came with the source
+// RSS item — most RSS feeds don't reliably include one, which was causing
+// almost every article to get skipped as "bad image". Instead, every article
+// gets a purpose-made image: Gemini generates it from the headline/category,
+// then it's uploaded to Cloudinary so MongoDB only ever stores a URL (same as
+// before), not the image bytes themselves.
+
+async function generateImageWithGemini(title, category, contextText) {
+  checkGeminiDayReset();
+  if (GEMINI_API_KEYS.length === 0 || geminiImageCallsToday >= GEMINI_IMAGE_MAX_PER_DAY) return null;
+  geminiImageCallsToday++;
+
+  const prompt = `Create a clean, professional editorial news photograph that visually represents this news story — the kind of photo that would run alongside a real news article.
+
+Headline: "${title}"
+Category: ${category}
+${contextText ? `Context: ${contextText.substring(0, 300)}` : ''}
+
+Style requirements: realistic photojournalism style, wide/landscape composition, natural lighting, no text or captions anywhere in the image, no logos or watermarks, no borders, safe-for-work, neutral and non-graphic (do not depict violence, injury, or blood even if the story involves them — represent the topic symbolically instead).`;
+
+  try {
+    const res = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-image:generateContent?key=${nextGeminiKey()}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: prompt }] }],
+          generationConfig: { responseModalities: ['IMAGE'] }
+        })
+      }
+    );
+    const data = await res.json();
+    if (!res.ok || data.error) {
+      console.error('   ⚠️ Gemini image generation failed:', data.error?.message || res.status);
+      return null;
+    }
+    const parts = data?.candidates?.[0]?.content?.parts || [];
+    const imgPart = parts.find(p => p.inlineData || p.inline_data);
+    const inline = imgPart?.inlineData || imgPart?.inline_data;
+    if (!inline?.data) return null;
+    return { base64: inline.data, mimeType: inline.mimeType || inline.mime_type || 'image/png' };
+  } catch (e) {
+    console.error('   ⚠️ Gemini image generation error:', e.message);
+    return null;
+  }
+}
+
+async function uploadImageToCloudinary(base64Data, mimeType) {
+  if (!CLOUDINARY_CLOUD_NAME || !CLOUDINARY_API_KEY || !CLOUDINARY_API_SECRET) return null;
+  try {
+    const timestamp = Math.floor(Date.now() / 1000);
+    const signature = crypto.createHash('sha1').update(`timestamp=${timestamp}${CLOUDINARY_API_SECRET}`).digest('hex');
+    const body = new URLSearchParams({
+      file: `data:${mimeType};base64,${base64Data}`,
+      timestamp: String(timestamp),
+      api_key: CLOUDINARY_API_KEY,
+      signature
+    });
+    const res = await fetch(`https://api.cloudinary.com/v1_1/${CLOUDINARY_CLOUD_NAME}/image/upload`, {
+      method: 'POST',
+      body
+    });
+    const data = await res.json();
+    if (!res.ok || !data.secure_url) {
+      console.error('   ⚠️ Cloudinary upload failed:', data.error?.message || 'unknown error');
+      return null;
+    }
+    return data.secure_url;
+  } catch (e) {
+    console.error('   ⚠️ Cloudinary upload error:', e.message);
+    return null;
+  }
+}
+
+// Combines the two steps above — this is what the fetch pipeline actually
+// calls. Returns a hosted URL on success, or null if either step failed (in
+// which case the caller skips the article this cycle and retries next time,
+// same as the old "bad image" skip used to work).
+async function generateAndHostArticleImage(title, category, contextText) {
+  const generated = await generateImageWithGemini(title, category, contextText);
+  if (!generated) return null;
+  return await uploadImageToCloudinary(generated.base64, generated.mimeType);
+}
+
 // ========== GEMINI REWRITE ==========
 // Takes the raw facts from the source APIs and asks Gemini to write an
 // original Newzyy article from them. Returns null text on any failure so the
@@ -1385,6 +1487,7 @@ function checkGeminiDayReset() {
     geminiDayStamp = today;
     geminiRewriteCallsToday = 0;
     geminiTranslateCallsToday = 0;
+    geminiImageCallsToday = 0;
   }
 }
 function checkGroqDayReset() {
@@ -1845,13 +1948,6 @@ async function fetchAllNews() {
         continue;
       }
 
-      // ----- Image check first (cheap, saves wasting a Gemini call on articles we'd reject anyway) -----
-      const hasGoodImage = await isGoodImage(article.image);
-      if (!hasGoodImage) {
-        stats[cat].skippedImage++;
-        continue;
-      }
-
       // ----- AI rewrite: Gemini → Groq → Mistral → Cerebras → Cohere -----
       const noProviderLeft =
         (GEMINI_API_KEYS.length === 0 || geminiRewriteCallsToday >= GEMINI_REWRITE_MAX_PER_DAY) &&
@@ -1898,6 +1994,15 @@ async function fetchAllNews() {
         continue;
       }
 
+      // ----- Generate the article's image now — only for articles that are
+      // actually about to be published, so we don't waste image-generation
+      // quota / Cloudinary uploads on anything that got skipped above. -----
+      const generatedImage = await generateAndHostArticleImage(article.title, cat, englishDraft.excerpt);
+      if (!generatedImage) {
+        stats[cat].skippedImage++; // will retry next cycle, same as before
+        continue;
+      }
+
       try {
         await Article.create({
           id: `auto_${Date.now()}_${Math.random().toString(36).substring(2, 10)}`,
@@ -1908,7 +2013,7 @@ async function fetchAllNews() {
           author: 'Newzyy Staff',
           views: Math.floor(Math.random() * 5000) + 100,
           comments: Math.floor(Math.random() * 200),
-          image: article.image,
+          image: generatedImage,
           imageAlt: article.title,
           status: 'published',
           // Kept internally for editorial record-keeping only — not shown on the site.
@@ -1932,7 +2037,7 @@ async function fetchAllNews() {
 
   CATEGORIES.forEach(cat => {
     const s = stats[cat];
-    console.log(`   ✅ ${cat}: ${s.added} added, ${s.skippedImage} skipped (bad/missing image), ${s.skippedGemini} skipped (rewrite/quota), ${s.skippedSensitive} skipped (sensitive content)`);
+    console.log(`   ✅ ${cat}: ${s.added} added, ${s.skippedImage} skipped (image generation failed), ${s.skippedGemini} skipped (rewrite/quota), ${s.skippedSensitive} skipped (sensitive content)`);
   });
 
   // Retention: 90 days, not 3 — permanent-ish URLs matter for SEO and social shares.
