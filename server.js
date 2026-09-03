@@ -97,7 +97,7 @@ const CLOUDINARY_API_SECRET = process.env.CLOUDINARY_API_SECRET;
 // Used as a fallback when Gemini's quota runs out — genuinely combines both
 // companies' free tiers rather than trying to bypass either one's limits.
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
-const GROQ_MODEL = 'llama-3.1-8b-instant'; // most generous free-tier limits on Groq
+const GROQ_MODEL = 'openai/gpt-oss-20b'; // Groq deprecated llama-3.1-8b-instant on 2026-06-17; this is Groq's official recommended replacement
 const GROQ_REWRITE_MAX_PER_DAY = 3600;
 const GROQ_TRANSLATE_MAX_PER_DAY = 8400;
 let groqRewriteCallsToday = 0;
@@ -115,7 +115,7 @@ let mistralDayStamp = new Date().toDateString();
 
 // ----- Cerebras: fourth AI provider (rewrite fallback — free tier, OpenAI-compatible, very fast) -----
 const CEREBRAS_API_KEY = process.env.CEREBRAS_API_KEY;
-const CEREBRAS_MODEL = 'llama-3.3-70b';
+const CEREBRAS_MODEL = 'gpt-oss-120b'; // llama-3.3-70b was removed from Cerebras' catalog; this is currently the only production-grade model they offer
 const CEREBRAS_MAX_PER_DAY = 800; // conservative — Cerebras free tier is generous, raise once confirmed on your account
 let cerebrasCallsToday = 0;
 let cerebrasDayStamp = new Date().toDateString();
@@ -1508,7 +1508,7 @@ ${sourceFacts}`;
 
   try {
     const res = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${nextGeminiKey()}`,
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent?key=${nextGeminiKey()}`,
       {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -1844,7 +1844,7 @@ async function translateWithGemini(article, langCode) {
   if (GEMINI_API_KEYS.length === 0) return null;
   try {
     const res = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${nextGeminiKey()}`,
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent?key=${nextGeminiKey()}`,
       {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
