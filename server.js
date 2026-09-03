@@ -1349,17 +1349,22 @@ async function isGoodImage(url) {
 
 // Cloudinary delivery transformation applied to every image on the site —
 // crops to a consistent 1200x630 landscape, auto-optimizes format/quality.
-// This is what "cleans" a source image that came in an odd size or format.
-const IMAGE_TRANSFORM = 'c_fill,w_1200,h_630,q_auto,f_auto';
+// g_auto = smart/AI-aware cropping so subjects don't get cut off. q_auto:good
+// keeps a higher quality floor than plain q_auto.
+const IMAGE_TRANSFORM = 'c_fill,g_auto,w_1200,h_630,q_auto:good,f_auto';
 function withCloudinaryTransform(url) {
   if (!url || !url.includes('/upload/')) return url;
   return url.replace('/upload/', `/upload/${IMAGE_TRANSFORM}/`);
 }
 
-// Very lenient on purpose — this only needs to catch actually-broken links
-// and 1x1 tracking pixels, not reject a real (if smallish) news thumbnail.
-const SOURCE_IMAGE_MIN_BYTES = 1200;
-const SOURCE_IMAGE_MIN_DIM = 80;
+// A source image below this size looks visibly blurry/pixelated once
+// Cloudinary crops it up to the site's 1200x630 display size — stretching a
+// small image up destroys quality. Anything under this bar is treated as "no
+// usable source image", so the pipeline falls through to a sharp,
+// full-resolution AI-generated image instead of publishing a blurry one.
+const SOURCE_IMAGE_MIN_BYTES = 6000;
+const SOURCE_IMAGE_MIN_WIDTH = 480;
+const SOURCE_IMAGE_MIN_HEIGHT = 270;
 async function fetchSourceImageBytes(url) {
   if (!url) return null;
   try {
@@ -1377,7 +1382,7 @@ async function fetchSourceImageBytes(url) {
 
     const dimensions = sizeOf(buffer);
     if (!dimensions.width || !dimensions.height) return null;
-    if (dimensions.width < SOURCE_IMAGE_MIN_DIM || dimensions.height < SOURCE_IMAGE_MIN_DIM) return null;
+    if (dimensions.width < SOURCE_IMAGE_MIN_WIDTH || dimensions.height < SOURCE_IMAGE_MIN_HEIGHT) return null;
 
     return { buffer, mimeType: contentType };
   } catch (e) {
