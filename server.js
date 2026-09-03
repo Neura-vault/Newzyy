@@ -1335,44 +1335,60 @@ async function isGoodImage(url) {
   }
 }
 
-// ========== AI-GENERATED ARTICLE IMAGES ==========
-// The pipeline no longer uses the image (if any) that came with the source
-// RSS item — most RSS feeds don't reliably include one. Instead, every
-// article gets a purpose-made image: Gemini generates it from the
-// headline/category, then it's uploaded to Cloudinary so MongoDB only ever
-// stores a URL (same as before), not the image bytes themselves.
-//
-// IMPORTANT: image generation is treated as a bonus, never a gate. Google's
-// quota applies per PROJECT, not per key, so 5 keys don't necessarily mean 5x
-// image budget — it can run out well before rewrite/translate quota does. If
-// it does, the article still publishes, just with the fallback card below
-// instead of an AI image, rather than being skipped entirely.
+// ========== ARTICLE IMAGES ==========
+// Priority order, and nothing here ever skips an article:
+//   1. The image that came with the source RSS item — fetched, lightly
+//      validated (just rejects broken links / tracking pixels, not strict
+//      like before), and re-hosted through Cloudinary with a standard crop so
+//      it's clean and consistent regardless of the original source's sizing.
+//   2. If the source had no image at all: Gemini generates a real,
+//      photorealistic image specific to that article's topic — the same kind
+//      of image other news sites would run, not a generic placeholder.
+//   3. Only if both of the above fail (network/quota issues): a simple
+//      branded category card, so publishing is never blocked.
 
-// Spread image-gen attempts across the day's cycles instead of trying to
-// generate images for every single article in the very first cycle (which is
-// what was silently exhausting the daily quota within 1-2 hours). Reset once
-// per fetchAllNews() run.
+// Cloudinary delivery transformation applied to every image on the site —
+// crops to a consistent 1200x630 landscape, auto-optimizes format/quality.
+// This is what "cleans" a source image that came in an odd size or format.
+const IMAGE_TRANSFORM = 'c_fill,w_1200,h_630,q_auto,f_auto';
+function withCloudinaryTransform(url) {
+  if (!url || !url.includes('/upload/')) return url;
+  return url.replace('/upload/', `/upload/${IMAGE_TRANSFORM}/`);
+}
+
+// Very lenient on purpose — this only needs to catch actually-broken links
+// and 1x1 tracking pixels, not reject a real (if smallish) news thumbnail.
+const SOURCE_IMAGE_MIN_BYTES = 1200;
+const SOURCE_IMAGE_MIN_DIM = 80;
+async function fetchSourceImageBytes(url) {
+  if (!url) return null;
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 6000);
+    const res = await fetch(url, { signal: controller.signal });
+    clearTimeout(timeout);
+
+    if (!res.ok) return null;
+    const contentType = res.headers.get('content-type') || '';
+    if (!contentType.startsWith('image/')) return null;
+
+    const buffer = await res.buffer();
+    if (buffer.length < SOURCE_IMAGE_MIN_BYTES) return null;
+
+    const dimensions = sizeOf(buffer);
+    if (!dimensions.width || !dimensions.height) return null;
+    if (dimensions.width < SOURCE_IMAGE_MIN_DIM || dimensions.height < SOURCE_IMAGE_MIN_DIM) return null;
+
+    return { buffer, mimeType: contentType };
+  } catch (e) {
+    return null; // broken link, timeout, corrupt file — just means "no usable source image"
+  }
+}
+
+// Spread AI image-gen attempts across the day's cycles instead of burning the
+// whole day's quota in the first cycle. Reset once per fetchAllNews() run.
 const GEMINI_IMAGE_MAX_PER_CYCLE = 15;
 let geminiImageCallsThisCycle = 0;
-
-// Deterministic, on-brand color per category so the same category always
-// looks the same. No API call, no cost, cannot fail — this is what publishes
-// when AI image generation isn't available (quota, error, etc.).
-const CATEGORY_FALLBACK_COLOR = {
-  politics: '#7c2d12', technology: '#1e3a8a', ai: '#312e81', sports: '#166534',
-  business: '#78350f', health: '#831843', science: '#164e63', entertainment: '#701a75',
-  travel: '#0e7490', environment: '#14532d', culture: '#9a3412', world: '#1e293b', economy: '#713f12'
-};
-function buildFallbackImage(category) {
-  const bg = CATEGORY_FALLBACK_COLOR[category] || '#1f2937';
-  const label = category.toUpperCase();
-  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630">
-    <rect width="1200" height="630" fill="${bg}"/>
-    <text x="600" y="345" font-family="Georgia, serif" font-size="56" font-weight="700" fill="#ffffff" text-anchor="middle" opacity="0.92">${label}</text>
-    <text x="600" y="405" font-family="Arial, sans-serif" font-size="26" letter-spacing="6" fill="#ffffff" text-anchor="middle" opacity="0.6">NEWZYY</text>
-  </svg>`;
-  return `data:image/svg+xml;base64,${Buffer.from(svg).toString('base64')}`;
-}
 
 async function generateImageWithGemini(title, category, contextText) {
   checkGeminiDayReset();
@@ -1382,7 +1398,7 @@ async function generateImageWithGemini(title, category, contextText) {
   geminiImageCallsToday++;
   geminiImageCallsThisCycle++;
 
-  const prompt = `Create a clean, professional editorial news photograph that visually represents this news story — the kind of photo that would run alongside a real news article.
+  const prompt = `Create a clean, professional editorial news photograph that visually represents this news story — the kind of real photo that would run alongside this article on a major news website.
 
 Headline: "${title}"
 Category: ${category}
@@ -1404,27 +1420,27 @@ Style requirements: realistic photojournalism style, wide/landscape composition,
     );
     const data = await res.json();
     if (!res.ok || data.error) {
-      console.error('   ⚠️ Gemini image generation failed (falling back to placeholder):', data.error?.message || res.status);
+      console.error('   ⚠️ Gemini image generation failed:', data.error?.message || res.status);
       return null;
     }
     const parts = data?.candidates?.[0]?.content?.parts || [];
     const imgPart = parts.find(p => p.inlineData || p.inline_data);
     const inline = imgPart?.inlineData || imgPart?.inline_data;
     if (!inline?.data) return null;
-    return { base64: inline.data, mimeType: inline.mimeType || inline.mime_type || 'image/png' };
+    return { buffer: Buffer.from(inline.data, 'base64'), mimeType: inline.mimeType || inline.mime_type || 'image/png' };
   } catch (e) {
-    console.error('   ⚠️ Gemini image generation error (falling back to placeholder):', e.message);
+    console.error('   ⚠️ Gemini image generation error:', e.message);
     return null;
   }
 }
 
-async function uploadImageToCloudinary(base64Data, mimeType) {
+async function uploadImageToCloudinary(buffer, mimeType) {
   if (!CLOUDINARY_CLOUD_NAME || !CLOUDINARY_API_KEY || !CLOUDINARY_API_SECRET) return null;
   try {
     const timestamp = Math.floor(Date.now() / 1000);
     const signature = crypto.createHash('sha1').update(`timestamp=${timestamp}${CLOUDINARY_API_SECRET}`).digest('hex');
     const body = new URLSearchParams({
-      file: `data:${mimeType};base64,${base64Data}`,
+      file: `data:${mimeType};base64,${buffer.toString('base64')}`,
       timestamp: String(timestamp),
       api_key: CLOUDINARY_API_KEY,
       signature
@@ -1435,27 +1451,38 @@ async function uploadImageToCloudinary(base64Data, mimeType) {
     });
     const data = await res.json();
     if (!res.ok || !data.secure_url) {
-      console.error('   ⚠️ Cloudinary upload failed (falling back to placeholder):', data.error?.message || 'unknown error');
+      console.error('   ⚠️ Cloudinary upload failed:', data.error?.message || 'unknown error');
       return null;
     }
-    return data.secure_url;
+    return withCloudinaryTransform(data.secure_url);
   } catch (e) {
-    console.error('   ⚠️ Cloudinary upload error (falling back to placeholder):', e.message);
+    console.error('   ⚠️ Cloudinary upload error:', e.message);
     return null;
   }
 }
 
-// Combines the two steps above. ALWAYS returns a usable image URL — either
-// the real AI-generated one, or the zero-cost fallback card if generation or
-// upload failed for any reason. Never returns null, so this can never block
-// an article from publishing.
-async function generateAndHostArticleImage(title, category, contextText) {
+// The single entry point the fetch pipeline calls. Returns { url, source } on
+// success, or null if NEITHER a real source image NOR an AI-generated one
+// could be produced this attempt. On null, the caller skips the article for
+// this cycle — since it never got saved, it's picked up again automatically
+// next cycle (real news doesn't disappear, it just waits one cycle rather
+// than ever publishing with a generic placeholder card).
+async function resolveArticleImage(sourceImageUrl, title, category, contextText) {
+  // 1. The source's own image, cleaned up and re-hosted
+  const sourceImage = await fetchSourceImageBytes(sourceImageUrl);
+  if (sourceImage) {
+    const hostedUrl = await uploadImageToCloudinary(sourceImage.buffer, sourceImage.mimeType);
+    if (hostedUrl) return { url: hostedUrl, source: 'fetched' };
+  }
+
+  // 2. No usable source image — AI generates one specific to this article
   const generated = await generateImageWithGemini(title, category, contextText);
   if (generated) {
-    const hostedUrl = await uploadImageToCloudinary(generated.base64, generated.mimeType);
-    if (hostedUrl) return { url: hostedUrl, aiGenerated: true };
+    const hostedUrl = await uploadImageToCloudinary(generated.buffer, generated.mimeType);
+    if (hostedUrl) return { url: hostedUrl, source: 'ai' };
   }
-  return { url: buildFallbackImage(category), aiGenerated: false };
+
+  return null; // neither worked this time — try again next cycle, never publish with a placeholder
 }
 
 // ========== GEMINI REWRITE ==========
@@ -1963,7 +1990,7 @@ async function fetchAllNews() {
   // Every category gets a turn before any category gets a second turn, so if
   // the Gemini budget runs out mid-cycle, every category already had a fair share.
   const stats = {};
-  CATEGORIES.forEach(c => (stats[c] = { added: 0, aiImage: 0, fallbackImage: 0, skippedGemini: 0, skippedSensitive: 0 }));
+  CATEGORIES.forEach(c => (stats[c] = { added: 0, fetchedImage: 0, aiImage: 0, skippedImage: 0, skippedGemini: 0, skippedSensitive: 0 }));
 
   let totalNew = 0;
   let round = 0;
@@ -2032,10 +2059,16 @@ async function fetchAllNews() {
         continue;
       }
 
-      // ----- Get the article's image — AI-generated if quota allows, a clean
-      // fallback card otherwise. This never fails and never blocks publishing. -----
-      const { url: imageUrl, aiGenerated } = await generateAndHostArticleImage(article.title, cat, englishDraft.excerpt);
-      if (aiGenerated) stats[cat].aiImage++; else stats[cat].fallbackImage++;
+      // ----- Get the article's image: real source image first, AI-generated
+      // second. If neither works this attempt, skip and retry next cycle —
+      // never publish with a generic placeholder card. -----
+      const imageResult = await resolveArticleImage(article.image, article.title, cat, englishDraft.excerpt);
+      if (!imageResult) {
+        stats[cat].skippedImage++; // will retry as a "new" article next cycle
+        continue;
+      }
+      const { url: imageUrl, source: imageSource } = imageResult;
+      stats[cat][imageSource === 'fetched' ? 'fetchedImage' : 'aiImage']++;
 
       try {
         await Article.create({
@@ -2071,7 +2104,7 @@ async function fetchAllNews() {
 
   CATEGORIES.forEach(cat => {
     const s = stats[cat];
-    console.log(`   ✅ ${cat}: ${s.added} added (${s.aiImage} AI image, ${s.fallbackImage} fallback image), ${s.skippedGemini} skipped (rewrite/quota), ${s.skippedSensitive} skipped (sensitive content)`);
+    console.log(`   ✅ ${cat}: ${s.added} added (${s.fetchedImage} fetched image, ${s.aiImage} AI image), ${s.skippedImage} skipped (no real image available), ${s.skippedGemini} skipped (rewrite/quota), ${s.skippedSensitive} skipped (sensitive content)`);
   });
 
   // Retention: 90 days, not 3 — permanent-ish URLs matter for SEO and social shares.
