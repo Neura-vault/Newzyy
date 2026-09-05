@@ -36,6 +36,10 @@ const PORT = process.env.PORT || 3001;
 
 // ========== FRONTEND URL (for sitemap/rss absolute links) ==========
 const SITE_URL = process.env.SITE_URL || 'https://newzyy.site';
+// The frontend (SITE_URL) is a static site on GitHub Pages — it can't handle
+// API requests. Links that need to hit this backend directly (like the
+// one-click newsletter unsubscribe link inside emails) must point here instead.
+const BACKEND_URL = process.env.BACKEND_URL || 'https://newzyy.onrender.com';
 
 // ========== API KEYS ==========
 // Gemini now supports up to 5 keys, round-robin rotated — set GEMINI_API_KEY,
@@ -581,9 +585,51 @@ async function sendWelcomeDigest(email) {
     excerpt: a.excerpt,
     url: `${SITE_URL}/article/?id=${a.id}`
   }));
-  const ok = await sendNewsletterDigest(email, articlesForEmail);
+  const ok = await sendNewsletterDigest(email, articlesForEmail, buildUnsubscribeUrl(email));
   if (ok) await Subscriber.updateOne({ email }, { lastSentAt: new Date() });
 }
+
+// Signs an email into a short token so the one-click unsubscribe link in
+// newsletter emails can't be guessed/reused for someone else's address —
+// same HMAC approach, just scoped to this one purpose. Deterministic (no
+// expiry) so old emails' unsubscribe links keep working indefinitely.
+function buildUnsubscribeToken(email) {
+  return crypto.createHmac('sha256', JWT_SECRET || 'newzyy-fallback-secret')
+    .update(email.toLowerCase().trim())
+    .digest('hex')
+    .substring(0, 32);
+}
+function buildUnsubscribeUrl(email) {
+  return `${BACKEND_URL}/api/newsletter/unsubscribe?email=${encodeURIComponent(email)}&token=${buildUnsubscribeToken(email)}`;
+}
+
+function unsubscribePage(message, showHomeLink) {
+  return `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Newzyy Newsletter</title></head>
+  <body style="font-family:Arial,sans-serif;max-width:440px;margin:70px auto;padding:24px;text-align:center;color:#1a1a1a;">
+    <div style="font-size:1.6rem;font-weight:900;margin-bottom:22px;">Newzy<span style="color:#b80000;">y</span></div>
+    <p style="font-size:1rem;line-height:1.5;">${message}</p>
+    ${showHomeLink ? `<a href="${SITE_URL}" style="display:inline-block;margin-top:18px;padding:11px 24px;background:#b80000;color:#fff;text-decoration:none;font-weight:700;border-radius:2px;">Back to Newzyy</a>` : ''}
+  </body></html>`;
+}
+
+// One-click unsubscribe — clicking the link in the email hits this directly,
+// no login or form needed. To re-subscribe, the same email address can just
+// be entered again in the newsletter box on the site.
+app.get('/api/newsletter/unsubscribe', async (req, res) => {
+  const email = (req.query.email || '').toString().toLowerCase().trim();
+  const token = (req.query.token || '').toString();
+
+  if (!email || !token || buildUnsubscribeToken(email) !== token) {
+    return res.status(400).send(unsubscribePage('This unsubscribe link is invalid or has expired.', true));
+  }
+  try {
+    await Subscriber.updateOne({ email }, { active: false });
+    res.send(unsubscribePage("You've been unsubscribed — you won't receive any more newsletter emails. Changed your mind? Just enter your email again in the newsletter box on the site to resubscribe anytime.", true));
+  } catch (e) {
+    res.status(500).send(unsubscribePage('Something went wrong. Please try again in a moment.', true));
+  }
+});
 
 app.post('/api/newsletter/unsubscribe', async (req, res) => {
   try {
@@ -615,7 +661,7 @@ async function sendDailyDigest() {
     const subscribers = await Subscriber.find({ active: true }).lean();
     let sent = 0;
     for (const sub of subscribers) {
-      const ok = await sendNewsletterDigest(sub.email, articlesForEmail);
+      const ok = await sendNewsletterDigest(sub.email, articlesForEmail, buildUnsubscribeUrl(sub.email));
       if (ok) {
         sent++;
         await Subscriber.updateOne({ _id: sub._id }, { lastSentAt: new Date() });
