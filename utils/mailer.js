@@ -95,24 +95,49 @@ async function sendContactNotification(name, fromEmail, message) {
   );
 }
 
-async function sendNewsletterDigest(toEmail, articles) {
-  const itemsHtml = articles.map(a => `
-    <div style="margin-bottom:18px;padding-bottom:18px;border-bottom:1px solid #e3ded3;">
-      <div style="font-size:0.65rem;font-weight:800;text-transform:uppercase;color:#b80000;">${a.category}</div>
-      <div style="font-size:1rem;font-weight:700;margin:4px 0;">${a.title}</div>
-      <div style="font-size:0.85rem;color:#666;">${(a.excerpt || '').substring(0, 120)}...</div>
-      <a href="${a.url}" style="font-size:0.8rem;color:#b80000;font-weight:600;">Read more →</a>
+// Same accent colors used for categories on the site, so the newsletter feels
+// like part of the same brand rather than a plain generic digest.
+const NEWSLETTER_CATEGORY_COLOR = {
+  Politics: '#7c2d12', Technology: '#1e3a8a', AI: '#312e81', Sports: '#166534',
+  Business: '#78350f', Health: '#831843', Science: '#164e63', Entertainment: '#701a75',
+  Travel: '#0e7490', Earth: '#14532d', Culture: '#9a3412', World: '#1e293b', Economy: '#713f12'
+};
+
+async function sendNewsletterDigest(toEmail, articles, unsubscribeUrl) {
+  const today = new Date().toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' });
+
+  const itemsHtml = articles.map((a, i) => {
+    const color = NEWSLETTER_CATEGORY_COLOR[a.category] || '#b80000';
+    return `
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin-bottom:22px;">
+      <tr>
+        <td style="width:34px;vertical-align:top;font-size:1.3rem;font-weight:900;color:#d9d3c4;">${i + 1}</td>
+        <td style="vertical-align:top;">
+          <div style="display:inline-block;font-size:0.62rem;font-weight:800;text-transform:uppercase;letter-spacing:0.4px;color:#fff;background:${color};padding:3px 9px;border-radius:2px;">${a.category}</div>
+          <div style="font-size:1.05rem;font-weight:700;line-height:1.35;margin:8px 0 6px;">${a.title}</div>
+          <div style="font-size:0.85rem;color:#666;line-height:1.5;">${(a.excerpt || '').substring(0, 130)}...</div>
+          <a href="${a.url}" style="display:inline-block;margin-top:8px;font-size:0.8rem;color:#b80000;font-weight:700;text-decoration:none;">Read the full story →</a>
+        </td>
+      </tr>
+    </table>`;
+  }).join('<div style="border-bottom:1px solid #ece7db;margin-bottom:20px;"></div>');
+
+  const bodyHtml = `
+    <p style="font-size:0.75rem;color:#999;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:18px;">${today}</p>
+    ${itemsHtml}
+    <div style="margin-top:28px;padding-top:18px;border-top:2px solid #1a1a1a;text-align:center;">
+      <p style="font-size:0.75rem;color:#999;line-height:1.6;">
+        You're receiving this because you subscribed at newzyy.site.<br>
+        <a href="${unsubscribeUrl}" style="color:#999;text-decoration:underline;">Unsubscribe</a>
+        — you can always resubscribe later by entering your email again on the site.
+      </p>
     </div>
-  `).join('');
+  `;
 
   return sendEmail(
     toEmail,
-    `Today's top stories from Newzyy`,
-    wrapEmail("Today's Top Stories", itemsHtml + `
-      <p style="font-size:0.75rem;color:#999;margin-top:10px;">
-        You're receiving this because you subscribed at newzyy.site.
-      </p>
-    `)
+    `Today's top stories from Newzyy — ${today}`,
+    wrapEmail("Today's Top Stories", bodyHtml)
   );
 }
 
