@@ -1524,6 +1524,13 @@ async function resolveArticleImage(sourceImageUrl, title, category, contextText)
   if (sourceImage) {
     const hostedUrl = await uploadImageToCloudinary(sourceImage.buffer, sourceImage.mimeType);
     if (hostedUrl) return { url: hostedUrl, source: 'fetched' };
+    // Cloudinary couldn't host it (account/quota/outage issue) — but this is
+    // still a real, verified, article-relevant image sitting at a working
+    // URL. Use it directly rather than blocking the whole article on a
+    // hosting problem that has nothing to do with whether a good image
+    // exists. It just won't get the standard crop/optimization this time.
+    console.error('   ⚠️ Cloudinary unavailable — using source image URL directly instead of skipping');
+    return { url: sourceImageUrl, source: 'fetched' };
   }
 
   // 2. No usable source image — AI generates one specific to this article
@@ -1531,6 +1538,8 @@ async function resolveArticleImage(sourceImageUrl, title, category, contextText)
   if (generated) {
     const hostedUrl = await uploadImageToCloudinary(generated.buffer, generated.mimeType);
     if (hostedUrl) return { url: hostedUrl, source: 'ai' };
+    // An AI-generated image only exists as raw bytes — with no host to put it
+    // on, there's genuinely nothing usable to fall back to here.
   }
 
   return null; // neither worked this time — try again next cycle, never publish with a placeholder
@@ -2172,6 +2181,8 @@ async function fetchAllNews() {
 
   console.log(`\n📊 SUMMARY: +${totalNew} new articles this cycle`);
   console.log(`   Gemini keys configured: ${GEMINI_API_KEYS.length > 0 ? GEMINI_API_KEYS.length : 'NONE — set GEMINI_API_KEY in Render, nothing will publish without it'}`);
+  const cloudinaryOk = Boolean(CLOUDINARY_CLOUD_NAME && CLOUDINARY_API_KEY && CLOUDINARY_API_SECRET);
+  console.log(`   Cloudinary configured: ${cloudinaryOk ? 'YES' : '⚠️ NO — AI-generated images will fail every time. Articles with no usable source image will be skipped every cycle until CLOUDINARY_CLOUD_NAME / CLOUDINARY_API_KEY / CLOUDINARY_API_SECRET are set in Render.'}`);
   console.log(`   Gemini — rewrite: ${geminiRewriteCallsToday}/${GEMINI_REWRITE_MAX_PER_DAY}, translate: ${geminiTranslateCallsToday}/${GEMINI_TRANSLATE_MAX_PER_DAY}`);
   console.log(`   Groq key configured: ${GROQ_API_KEY ? 'YES' : 'NO'} — rewrite: ${groqRewriteCallsToday}/${GROQ_REWRITE_MAX_PER_DAY}, translate: ${groqTranslateCallsToday}/${GROQ_TRANSLATE_MAX_PER_DAY}`);
   console.log(`   Mistral key configured: ${MISTRAL_API_KEY ? 'YES' : 'NO'} — rewrite: ${mistralRewriteCallsToday}/${MISTRAL_REWRITE_MAX_PER_DAY}, translate: ${mistralTranslateCallsToday}/${MISTRAL_TRANSLATE_MAX_PER_DAY}`);
