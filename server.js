@@ -153,7 +153,7 @@ mongoose.connect(MONGODB_URI)
   .catch(err => console.error('❌ MongoDB connection error:', err.message));
 
 app.use(cors({ origin: '*', methods: ['GET', 'POST', 'DELETE', 'PATCH', 'PUT', 'OPTIONS'], allowedHeaders: ['Content-Type', 'Authorization'] }));
-app.use(express.json());
+app.use(express.json({ limit: '8mb' })); // raised from Express's 100kb default to fit base64-encoded image uploads from the admin panel
 
 // ========== RATE LIMITING (protects auth + contact from abuse) ==========
 const authLimiter = rateLimit({
@@ -816,13 +816,11 @@ app.post('/api/admin/article/manual', async (req, res) => {
     const bodyHtml = body.trim().split(/\n\s*\n/).map(p => `<p>${p.trim().replace(/\n/g, ' ')}</p>`).join('');
     const excerptText = (excerpt && excerpt.trim()) || body.trim().substring(0, 200);
 
-    let finalImage = (image || '').trim();
-    if (finalImage) {
-      const goodImage = await isGoodImage(finalImage);
-      if (!goodImage) {
-        return res.status(400).json({ success: false, message: 'Image URL could not be verified — check the link is a direct, public image URL (ends in .jpg/.png/etc, not a webpage).' });
-      }
+    const imageCheck = await resolveImageFieldInput(image);
+    if (!imageCheck.ok) {
+      return res.status(400).json({ success: false, message: imageCheck.message });
     }
+    const finalImage = imageCheck.value;
 
     // Auto-translate into every active language, same as the automated
     // pipeline — optional, but on by default so the article shows correctly
@@ -893,11 +891,11 @@ app.patch('/api/admin/article/:id', async (req, res) => {
       article.body = body.trim().split(/\n\s*\n/).map(p => `<p>${p.trim().replace(/\n/g, ' ')}</p>`).join('');
     }
     if (typeof image === 'string' && image.trim()) {
-      const goodImage = await isGoodImage(image.trim());
-      if (!goodImage) {
-        return res.status(400).json({ success: false, message: 'Image URL could not be verified — check the link is a direct, public image URL.' });
+      const imageCheck = await resolveImageFieldInput(image.trim());
+      if (!imageCheck.ok) {
+        return res.status(400).json({ success: false, message: imageCheck.message });
       }
-      article.image = image.trim();
+      article.image = imageCheck.value;
     }
     if (typeof author === 'string' && author.trim()) article.author = author.trim();
     if (typeof manualBreaking === 'boolean') article.manualBreaking = manualBreaking;
@@ -1363,6 +1361,39 @@ async function isGoodImage(url) {
   } catch (e) {
     return false; // any uncertainty (timeout, bad data, network error) = reject, never crash
   }
+}
+
+// Validates an image the admin uploaded directly from the "Write Article"
+// panel — arrives as a base64 data URI (e.g. "data:image/png;base64,...."),
+// not a URL, so there's no network fetch involved: the bytes are already
+// right there in the request body. Stored as-is in the article's `image`
+// field (same as a URL would be) — the browser just renders a data URI the
+// same way it renders any other image src.
+const MAX_UPLOADED_IMAGE_BYTES = 5 * 1024 * 1024; // 5MB
+function validateUploadedImage(dataUri) {
+  const match = /^data:image\/(png|jpe?g|webp);base64,([A-Za-z0-9+/=]+)$/i.exec(dataUri || '');
+  if (!match) return { ok: false, message: 'Image must be a PNG, JPG, or WEBP file.' };
+  const approxBytes = Math.ceil((match[2].length * 3) / 4);
+  if (approxBytes > MAX_UPLOADED_IMAGE_BYTES) {
+    return { ok: false, message: 'Image is too large — please upload a file under 5MB.' };
+  }
+  return { ok: true };
+}
+// One field, two possible shapes: a browser-uploaded data URI (validated
+// locally, no network call) or a plain http(s) URL (validated by fetching it
+// with isGoodImage, kept for backward compatibility / editing older
+// articles that still have a URL-based image).
+async function resolveImageFieldInput(imageField) {
+  if (!imageField) return { ok: true, value: '' };
+  if (imageField.startsWith('data:image/')) {
+    const check = validateUploadedImage(imageField);
+    return check.ok ? { ok: true, value: imageField } : { ok: false, message: check.message };
+  }
+  const goodImage = await isGoodImage(imageField.trim());
+  if (!goodImage) {
+    return { ok: false, message: 'Image URL could not be verified — check the link is a direct, public image URL.' };
+  }
+  return { ok: true, value: imageField.trim() };
 }
 
 // ========== ARTICLE IMAGES ==========
