@@ -1478,7 +1478,7 @@ ${sourceFacts}`;
         if (!isNaN(seconds)) retryAfterMs = Math.min(Math.ceil(seconds * 1000), 70000); // cap at 70s, sanity limit
       }
       console.error(`   ⚠️ Gemini API error [${res.status}]:`, data.error?.message || JSON.stringify(data).substring(0, 300));
-      return { text: null, retryAfterMs };
+      return { text: null, retryAfterMs, quotaExceeded: res.status === 429 };
     }
 
     const text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
@@ -1564,7 +1564,7 @@ ${sourceFacts}`;
       // Groq sends a Retry-After header on 429s — honor it if present.
       const retryAfter = res.headers.get('retry-after');
       const retryAfterMs = retryAfter ? Math.min(parseInt(retryAfter) * 1000, 70000) : 0;
-      return { text: null, retryAfterMs };
+      return { text: null, retryAfterMs, quotaExceeded: res.status === 429 };
     }
 
     const text = data?.choices?.[0]?.message?.content;
@@ -1599,7 +1599,7 @@ async function rewriteWithMistral(rawArticle, category) {
       console.error(`   ⚠️ Mistral rewrite API error [${res.status}]:`, data.error?.message || JSON.stringify(data).substring(0, 300));
       const retryAfter = res.headers.get('retry-after');
       const retryAfterMs = retryAfter ? Math.min(parseInt(retryAfter) * 1000, 70000) : 0;
-      return { text: null, retryAfterMs };
+      return { text: null, retryAfterMs, quotaExceeded: res.status === 429 };
     }
 
     const text = data?.choices?.[0]?.message?.content;
@@ -1635,7 +1635,7 @@ async function rewriteWithCerebras(rawArticle, category) {
       console.error(`   ⚠️ Cerebras API error [${res.status}]:`, data.error?.message || JSON.stringify(data).substring(0, 300));
       const retryAfter = res.headers.get('retry-after');
       const retryAfterMs = retryAfter ? Math.min(parseInt(retryAfter) * 1000, 70000) : 0;
-      return { text: null, retryAfterMs };
+      return { text: null, retryAfterMs, quotaExceeded: res.status === 429 };
     }
 
     const text = data?.choices?.[0]?.message?.content;
@@ -1672,7 +1672,7 @@ async function rewriteWithCohere(rawArticle, category) {
       console.error(`   ⚠️ Cohere API error [${res.status}]:`, data.error?.message || JSON.stringify(data).substring(0, 300));
       const retryAfter = res.headers.get('retry-after');
       const retryAfterMs = retryAfter ? Math.min(parseInt(retryAfter) * 1000, 70000) : 0;
-      return { text: null, retryAfterMs };
+      return { text: null, retryAfterMs, quotaExceeded: res.status === 429 };
     }
 
     const text = data?.message?.content?.[0]?.text;
@@ -1702,6 +1702,7 @@ async function rewriteArticle(rawArticle, category) {
     const result = await rewriteWithGemini(rawArticle, category);
     geminiRewriteCallsToday++;
     if (result.text) return { ...result, provider: 'gemini' };
+    if (result.quotaExceeded) geminiRewriteCallsToday = GEMINI_REWRITE_MAX_PER_DAY; // stop retrying an exhausted provider for the rest of today
     // Gemini failed (quota/error) — fall through to the next provider.
   }
 
@@ -1709,24 +1710,28 @@ async function rewriteArticle(rawArticle, category) {
     const result = await rewriteWithGroq(rawArticle, category);
     groqRewriteCallsToday++;
     if (result.text) return { ...result, provider: 'groq' };
+    if (result.quotaExceeded) groqRewriteCallsToday = GROQ_REWRITE_MAX_PER_DAY;
   }
 
   if (MISTRAL_API_KEY && mistralRewriteCallsToday < MISTRAL_REWRITE_MAX_PER_DAY) {
     const result = await rewriteWithMistral(rawArticle, category);
     mistralRewriteCallsToday++;
     if (result.text) return { ...result, provider: 'mistral' };
+    if (result.quotaExceeded) mistralRewriteCallsToday = MISTRAL_REWRITE_MAX_PER_DAY;
   }
 
   if (CEREBRAS_API_KEY && cerebrasCallsToday < CEREBRAS_MAX_PER_DAY) {
     const result = await rewriteWithCerebras(rawArticle, category);
     cerebrasCallsToday++;
     if (result.text) return { ...result, provider: 'cerebras' };
+    if (result.quotaExceeded) cerebrasCallsToday = CEREBRAS_MAX_PER_DAY;
   }
 
   if (COHERE_API_KEY && cohereCallsToday < COHERE_MAX_PER_DAY) {
     const result = await rewriteWithCohere(rawArticle, category);
     cohereCallsToday++;
     if (result.text) return { ...result, provider: 'cohere' };
+    if (result.quotaExceeded) cohereCallsToday = COHERE_MAX_PER_DAY;
   }
 
   return { text: null, retryAfterMs: 0, provider: 'none' };
@@ -1792,7 +1797,7 @@ Body: ${(article.body || '').substring(0, 3000)}`;
 }
 
 async function translateWithGemini(article, langCode) {
-  if (GEMINI_API_KEYS.length === 0) return null;
+  if (GEMINI_API_KEYS.length === 0) return { data: null, quotaExceeded: false };
   try {
     const res = await fetch(
       `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent?key=${nextGeminiKey()}`,
@@ -1803,17 +1808,20 @@ async function translateWithGemini(article, langCode) {
       }
     );
     const data = await res.json();
-    if (!res.ok || data.error) return null;
+    if (!res.ok || data.error) {
+      console.error(`   ⚠️ Gemini translate API error [${res.status}]:`, data.error?.message || JSON.stringify(data).substring(0, 300));
+      return { data: null, quotaExceeded: res.status === 429 };
+    }
     const text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
-    return parseTranslationJSON(text);
+    return { data: parseTranslationJSON(text), quotaExceeded: false };
   } catch (e) {
     console.error('   ⚠️ Gemini translate error:', e.message);
-    return null;
+    return { data: null, quotaExceeded: false };
   }
 }
 
 async function translateWithGroq(article, langCode) {
-  if (!GROQ_API_KEY) return null;
+  if (!GROQ_API_KEY) return { data: null, quotaExceeded: false };
   try {
     const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
       method: 'POST',
@@ -1824,16 +1832,19 @@ async function translateWithGroq(article, langCode) {
       })
     });
     const data = await res.json();
-    if (!res.ok || data.error) return null;
-    return parseTranslationJSON(data?.choices?.[0]?.message?.content);
+    if (!res.ok || data.error) {
+      console.error(`   ⚠️ Groq translate API error [${res.status}]:`, data.error?.message || JSON.stringify(data).substring(0, 300));
+      return { data: null, quotaExceeded: res.status === 429 };
+    }
+    return { data: parseTranslationJSON(data?.choices?.[0]?.message?.content), quotaExceeded: false };
   } catch (e) {
     console.error('   ⚠️ Groq translate error:', e.message);
-    return null;
+    return { data: null, quotaExceeded: false };
   }
 }
 
 async function translateWithMistral(article, langCode) {
-  if (!MISTRAL_API_KEY) return null;
+  if (!MISTRAL_API_KEY) return { data: null, quotaExceeded: false };
   try {
     const res = await fetch('https://api.mistral.ai/v1/chat/completions', {
       method: 'POST',
@@ -1844,11 +1855,14 @@ async function translateWithMistral(article, langCode) {
       })
     });
     const data = await res.json();
-    if (!res.ok || data.error) return null;
-    return parseTranslationJSON(data?.choices?.[0]?.message?.content);
+    if (!res.ok || data.error) {
+      console.error(`   ⚠️ Mistral translate API error [${res.status}]:`, data.error?.message || JSON.stringify(data).substring(0, 300));
+      return { data: null, quotaExceeded: res.status === 429 };
+    }
+    return { data: parseTranslationJSON(data?.choices?.[0]?.message?.content), quotaExceeded: false };
   } catch (e) {
     console.error('   ⚠️ Mistral translate error:', e.message);
-    return null;
+    return { data: null, quotaExceeded: false };
   }
 }
 
@@ -1859,18 +1873,21 @@ async function translateArticle(article, langCode) {
 
   if (GEMINI_API_KEYS.length > 0 && geminiTranslateCallsToday < GEMINI_TRANSLATE_MAX_PER_DAY) {
     geminiTranslateCallsToday++;
-    const result = await translateWithGemini(article, langCode);
-    if (result) return result;
+    const { data, quotaExceeded } = await translateWithGemini(article, langCode);
+    if (data) return data;
+    if (quotaExceeded) geminiTranslateCallsToday = GEMINI_TRANSLATE_MAX_PER_DAY;
   }
   if (GROQ_API_KEY && groqTranslateCallsToday < GROQ_TRANSLATE_MAX_PER_DAY) {
     groqTranslateCallsToday++;
-    const result = await translateWithGroq(article, langCode);
-    if (result) return result;
+    const { data, quotaExceeded } = await translateWithGroq(article, langCode);
+    if (data) return data;
+    if (quotaExceeded) groqTranslateCallsToday = GROQ_TRANSLATE_MAX_PER_DAY;
   }
   if (MISTRAL_API_KEY && mistralTranslateCallsToday < MISTRAL_TRANSLATE_MAX_PER_DAY) {
     mistralTranslateCallsToday++;
-    const result = await translateWithMistral(article, langCode);
-    if (result) return result;
+    const { data, quotaExceeded } = await translateWithMistral(article, langCode);
+    if (data) return data;
+    if (quotaExceeded) mistralTranslateCallsToday = MISTRAL_TRANSLATE_MAX_PER_DAY;
   }
   return null;
 }
