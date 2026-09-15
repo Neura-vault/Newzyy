@@ -102,6 +102,30 @@ let mistralRewriteCallsToday = 0;
 let mistralTranslateCallsToday = 0;
 let mistralDayStamp = new Date().toDateString();
 
+// ----- 429 handling: short cooldown, NOT a day-long ban -----
+// These APIs return 429 for two very different reasons: a per-minute rate
+// limit (clears in seconds) or a genuinely exhausted daily quota (clears at
+// midnight). Treating every 429 as "done for the day" is what previously
+// killed all three providers within the first cycle and made every single
+// article skip as "rewrite/quota" for the rest of the day.
+// So: by default a 429 just parks that provider for a short cooldown; only a
+// 429 whose message explicitly mentions a daily/per-day limit marks it as
+// exhausted until tomorrow.
+const PROVIDER_COOLDOWN_MS = 60 * 1000;
+const providerCooldownUntil = { gemini: 0, groq: 0, mistral: 0 };
+function providerAvailable(name) {
+  return Date.now() >= (providerCooldownUntil[name] || 0);
+}
+function coolDownProvider(name, retryAfterMs) {
+  providerCooldownUntil[name] = Date.now() + Math.max(retryAfterMs || 0, PROVIDER_COOLDOWN_MS);
+}
+// True only when the provider is telling us the DAILY allowance is gone.
+function isDailyQuotaMessage(message) {
+  const m = (message || '').toLowerCase();
+  return m.includes('per day') || m.includes('perday') || m.includes('daily')
+      || m.includes('per-day') || m.includes('requests per day');
+}
+
 // Cerebras and Cohere were removed (previously the 4th/5th providers here).
 // Both turned out to be running on trial credits / a capped, non-commercial
 // "trial key" rather than a genuinely permanent free tier — Cerebras' free
@@ -1471,7 +1495,8 @@ ${sourceFacts}`;
         if (!isNaN(seconds)) retryAfterMs = Math.min(Math.ceil(seconds * 1000), 70000); // cap at 70s, sanity limit
       }
       console.error(`   ⚠️ Gemini API error [${res.status}]:`, data.error?.message || JSON.stringify(data).substring(0, 300));
-      return { text: null, retryAfterMs, quotaExceeded: res.status === 429 };
+      return { text: null, retryAfterMs, rateLimited: res.status === 429,
+               dailyExhausted: res.status === 429 && isDailyQuotaMessage(data.error?.message || JSON.stringify(data)) };
     }
 
     const text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
@@ -1557,7 +1582,8 @@ ${sourceFacts}`;
       // Groq sends a Retry-After header on 429s — honor it if present.
       const retryAfter = res.headers.get('retry-after');
       const retryAfterMs = retryAfter ? Math.min(parseInt(retryAfter) * 1000, 70000) : 0;
-      return { text: null, retryAfterMs, quotaExceeded: res.status === 429 };
+      return { text: null, retryAfterMs, rateLimited: res.status === 429,
+               dailyExhausted: res.status === 429 && isDailyQuotaMessage(data.error?.message || JSON.stringify(data)) };
     }
 
     const text = data?.choices?.[0]?.message?.content;
@@ -1592,7 +1618,8 @@ async function rewriteWithMistral(rawArticle, category) {
       console.error(`   ⚠️ Mistral rewrite API error [${res.status}]:`, data.error?.message || JSON.stringify(data).substring(0, 300));
       const retryAfter = res.headers.get('retry-after');
       const retryAfterMs = retryAfter ? Math.min(parseInt(retryAfter) * 1000, 70000) : 0;
-      return { text: null, retryAfterMs, quotaExceeded: res.status === 429 };
+      return { text: null, retryAfterMs, rateLimited: res.status === 429,
+               dailyExhausted: res.status === 429 && isDailyQuotaMessage(data.error?.message || JSON.stringify(data)) };
     }
 
     const text = data?.choices?.[0]?.message?.content;
@@ -1620,26 +1647,29 @@ async function rewriteArticle(rawArticle, category) {
   checkGroqDayReset();
   checkMistralDayReset();
 
-  if (GROQ_API_KEY && groqRewriteCallsToday < GROQ_REWRITE_MAX_PER_DAY) {
+  if (GROQ_API_KEY && providerAvailable('groq') && groqRewriteCallsToday < GROQ_REWRITE_MAX_PER_DAY) {
     const result = await rewriteWithGroq(rawArticle, category);
     groqRewriteCallsToday++;
     if (result.text) return { ...result, provider: 'groq' };
-    if (result.quotaExceeded) groqRewriteCallsToday = GROQ_REWRITE_MAX_PER_DAY;
+    if (result.rateLimited) coolDownProvider('groq', result.retryAfterMs);
+    if (result.dailyExhausted) groqRewriteCallsToday = GROQ_REWRITE_MAX_PER_DAY;
   }
 
-  if (GEMINI_API_KEYS.length > 0 && geminiRewriteCallsToday < GEMINI_REWRITE_MAX_PER_DAY) {
+  if (GEMINI_API_KEYS.length > 0 && providerAvailable('gemini') && geminiRewriteCallsToday < GEMINI_REWRITE_MAX_PER_DAY) {
     const result = await rewriteWithGemini(rawArticle, category);
     geminiRewriteCallsToday++;
     if (result.text) return { ...result, provider: 'gemini' };
-    if (result.quotaExceeded) geminiRewriteCallsToday = GEMINI_REWRITE_MAX_PER_DAY; // stop retrying an exhausted provider for the rest of today
-    // Gemini failed (quota/error) — fall through to the next provider.
+    if (result.rateLimited) coolDownProvider('gemini', result.retryAfterMs);
+    if (result.dailyExhausted) geminiRewriteCallsToday = GEMINI_REWRITE_MAX_PER_DAY;
+    // Gemini failed (rate limit/error) — fall through to the next provider.
   }
 
-  if (MISTRAL_API_KEY && mistralRewriteCallsToday < MISTRAL_REWRITE_MAX_PER_DAY) {
+  if (MISTRAL_API_KEY && providerAvailable('mistral') && mistralRewriteCallsToday < MISTRAL_REWRITE_MAX_PER_DAY) {
     const result = await rewriteWithMistral(rawArticle, category);
     mistralRewriteCallsToday++;
     if (result.text) return { ...result, provider: 'mistral' };
-    if (result.quotaExceeded) mistralRewriteCallsToday = MISTRAL_REWRITE_MAX_PER_DAY;
+    if (result.rateLimited) coolDownProvider('mistral', result.retryAfterMs);
+    if (result.dailyExhausted) mistralRewriteCallsToday = MISTRAL_REWRITE_MAX_PER_DAY;
   }
 
   return { text: null, retryAfterMs: 0, provider: 'none' };
@@ -1689,7 +1719,7 @@ Body: ${(article.body || '').substring(0, 3000)}`;
 }
 
 async function translateWithGemini(article, langCode) {
-  if (GEMINI_API_KEYS.length === 0) return { data: null, quotaExceeded: false };
+  if (GEMINI_API_KEYS.length === 0) return { data: null, rateLimited: false, dailyExhausted: false };
   try {
     const res = await fetch(
       `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent?key=${nextGeminiKey()}`,
@@ -1702,18 +1732,19 @@ async function translateWithGemini(article, langCode) {
     const data = await res.json();
     if (!res.ok || data.error) {
       console.error(`   ⚠️ Gemini translate API error [${res.status}]:`, data.error?.message || JSON.stringify(data).substring(0, 300));
-      return { data: null, quotaExceeded: res.status === 429 };
+      return { data: null, rateLimited: res.status === 429,
+               dailyExhausted: res.status === 429 && isDailyQuotaMessage(data.error?.message || JSON.stringify(data)) };
     }
     const text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
-    return { data: parseTranslationJSON(text), quotaExceeded: false };
+    return { data: parseTranslationJSON(text), rateLimited: false, dailyExhausted: false };
   } catch (e) {
     console.error('   ⚠️ Gemini translate error:', e.message);
-    return { data: null, quotaExceeded: false };
+    return { data: null, rateLimited: false, dailyExhausted: false };
   }
 }
 
 async function translateWithGroq(article, langCode) {
-  if (!GROQ_API_KEY) return { data: null, quotaExceeded: false };
+  if (!GROQ_API_KEY) return { data: null, rateLimited: false, dailyExhausted: false };
   try {
     const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
       method: 'POST',
@@ -1726,17 +1757,18 @@ async function translateWithGroq(article, langCode) {
     const data = await res.json();
     if (!res.ok || data.error) {
       console.error(`   ⚠️ Groq translate API error [${res.status}]:`, data.error?.message || JSON.stringify(data).substring(0, 300));
-      return { data: null, quotaExceeded: res.status === 429 };
+      return { data: null, rateLimited: res.status === 429,
+               dailyExhausted: res.status === 429 && isDailyQuotaMessage(data.error?.message || JSON.stringify(data)) };
     }
-    return { data: parseTranslationJSON(data?.choices?.[0]?.message?.content), quotaExceeded: false };
+    return { data: parseTranslationJSON(data?.choices?.[0]?.message?.content), rateLimited: false, dailyExhausted: false };
   } catch (e) {
     console.error('   ⚠️ Groq translate error:', e.message);
-    return { data: null, quotaExceeded: false };
+    return { data: null, rateLimited: false, dailyExhausted: false };
   }
 }
 
 async function translateWithMistral(article, langCode) {
-  if (!MISTRAL_API_KEY) return { data: null, quotaExceeded: false };
+  if (!MISTRAL_API_KEY) return { data: null, rateLimited: false, dailyExhausted: false };
   try {
     const res = await fetch('https://api.mistral.ai/v1/chat/completions', {
       method: 'POST',
@@ -1749,12 +1781,13 @@ async function translateWithMistral(article, langCode) {
     const data = await res.json();
     if (!res.ok || data.error) {
       console.error(`   ⚠️ Mistral translate API error [${res.status}]:`, data.error?.message || JSON.stringify(data).substring(0, 300));
-      return { data: null, quotaExceeded: res.status === 429 };
+      return { data: null, rateLimited: res.status === 429,
+               dailyExhausted: res.status === 429 && isDailyQuotaMessage(data.error?.message || JSON.stringify(data)) };
     }
-    return { data: parseTranslationJSON(data?.choices?.[0]?.message?.content), quotaExceeded: false };
+    return { data: parseTranslationJSON(data?.choices?.[0]?.message?.content), rateLimited: false, dailyExhausted: false };
   } catch (e) {
     console.error('   ⚠️ Mistral translate error:', e.message);
-    return { data: null, quotaExceeded: false };
+    return { data: null, rateLimited: false, dailyExhausted: false };
   }
 }
 
@@ -1763,23 +1796,26 @@ async function translateArticle(article, langCode) {
   checkGroqDayReset();
   checkMistralDayReset();
 
-  if (GROQ_API_KEY && groqTranslateCallsToday < GROQ_TRANSLATE_MAX_PER_DAY) {
+  if (GROQ_API_KEY && providerAvailable('groq') && groqTranslateCallsToday < GROQ_TRANSLATE_MAX_PER_DAY) {
     groqTranslateCallsToday++;
-    const { data, quotaExceeded } = await translateWithGroq(article, langCode);
+    const { data, rateLimited, dailyExhausted } = await translateWithGroq(article, langCode);
     if (data) return data;
-    if (quotaExceeded) groqTranslateCallsToday = GROQ_TRANSLATE_MAX_PER_DAY;
+    if (rateLimited) coolDownProvider('groq', 0);
+    if (dailyExhausted) groqTranslateCallsToday = GROQ_TRANSLATE_MAX_PER_DAY;
   }
-  if (GEMINI_API_KEYS.length > 0 && geminiTranslateCallsToday < GEMINI_TRANSLATE_MAX_PER_DAY) {
+  if (GEMINI_API_KEYS.length > 0 && providerAvailable('gemini') && geminiTranslateCallsToday < GEMINI_TRANSLATE_MAX_PER_DAY) {
     geminiTranslateCallsToday++;
-    const { data, quotaExceeded } = await translateWithGemini(article, langCode);
+    const { data, rateLimited, dailyExhausted } = await translateWithGemini(article, langCode);
     if (data) return data;
-    if (quotaExceeded) geminiTranslateCallsToday = GEMINI_TRANSLATE_MAX_PER_DAY;
+    if (rateLimited) coolDownProvider('gemini', 0);
+    if (dailyExhausted) geminiTranslateCallsToday = GEMINI_TRANSLATE_MAX_PER_DAY;
   }
-  if (MISTRAL_API_KEY && mistralTranslateCallsToday < MISTRAL_TRANSLATE_MAX_PER_DAY) {
+  if (MISTRAL_API_KEY && providerAvailable('mistral') && mistralTranslateCallsToday < MISTRAL_TRANSLATE_MAX_PER_DAY) {
     mistralTranslateCallsToday++;
-    const { data, quotaExceeded } = await translateWithMistral(article, langCode);
+    const { data, rateLimited, dailyExhausted } = await translateWithMistral(article, langCode);
     if (data) return data;
-    if (quotaExceeded) mistralTranslateCallsToday = MISTRAL_TRANSLATE_MAX_PER_DAY;
+    if (rateLimited) coolDownProvider('mistral', 0);
+    if (dailyExhausted) mistralTranslateCallsToday = MISTRAL_TRANSLATE_MAX_PER_DAY;
   }
   return null;
 }
@@ -1849,7 +1885,7 @@ async function fetchAllNews() {
   // Every category gets a turn before any category gets a second turn, so if
   // the Gemini budget runs out mid-cycle, every category already had a fair share.
   const stats = {};
-  CATEGORIES.forEach(c => (stats[c] = { added: 0, fetchedImage: 0, skippedImage: 0, skippedGemini: 0, skippedSensitive: 0 }));
+  CATEGORIES.forEach(c => (stats[c] = { added: 0, fetchedImage: 0, skippedImage: 0, skippedNoProvider: 0, skippedRewrite: 0, skippedTranslate: 0, skippedSensitive: 0 }));
 
   let totalNew = 0;
   let round = 0;
@@ -1878,14 +1914,14 @@ async function fetchAllNews() {
         (!GROQ_API_KEY || groqRewriteCallsToday >= GROQ_REWRITE_MAX_PER_DAY) &&
         (!MISTRAL_API_KEY || mistralRewriteCallsToday >= MISTRAL_REWRITE_MAX_PER_DAY);
       if (noProviderLeft) {
-        stats[cat].skippedGemini++;
+        stats[cat].skippedNoProvider++;
         continue;
       }
 
       const result = await rewriteArticle(article, cat);
 
       if (!result.text) {
-        stats[cat].skippedGemini++;
+        stats[cat].skippedRewrite++;
         await new Promise(r => setTimeout(r, result.retryAfterMs || GEMINI_DELAY_MS));
         continue;
       }
@@ -1912,7 +1948,9 @@ async function fetchAllNews() {
       }
 
       if (!allTranslationsOk) {
-        stats[cat].skippedGemini++; // counted as a skip — will retry as a "new" article next cycle
+        const failedLangs = translationResults.filter(r => !r.result).map(r => r.langCode);
+        console.error(`   ⚠️ ${cat}: translation failed for [${failedLangs.join(', ')}] — article skipped, will retry next cycle`);
+        stats[cat].skippedTranslate++; // counted as a skip — will retry as a "new" article next cycle
         continue;
       }
 
@@ -1960,7 +1998,7 @@ async function fetchAllNews() {
 
   CATEGORIES.forEach(cat => {
     const s = stats[cat];
-    console.log(`   ✅ ${cat}: ${s.added} added (${s.fetchedImage} with fetched image), ${s.skippedImage} skipped (no usable image), ${s.skippedGemini} skipped (rewrite/quota), ${s.skippedSensitive} skipped (sensitive content)`);
+    console.log(`   ✅ ${cat}: ${s.added} added (${s.fetchedImage} with fetched image), skipped → ${s.skippedRewrite} rewrite-failed, ${s.skippedTranslate} translate-failed, ${s.skippedNoProvider} no-provider-left, ${s.skippedImage} no-usable-image, ${s.skippedSensitive} sensitive`);
   });
 
   // Retention: 90 days, not 3 — permanent-ish URLs matter for SEO and social shares.
@@ -2069,9 +2107,39 @@ app.get('/api/admin/translation-coverage', async (req, res) => {
   }
 });
 
+// ========== PROVIDER SELF-TEST ==========
+// Runs once at boot. Makes one tiny call per provider and prints exactly what
+// came back, so a misconfigured key or a model name the provider has since
+// retired shows up immediately and unambiguously in the logs — instead of
+// silently turning into "every article skipped" hours later.
+async function selfTestProviders() {
+  console.log('\n🔍 Provider self-test:');
+  const probe = { title: 'Test', description: 'A short test sentence used only to verify the API connection works.', body: 'A short test sentence used only to verify the API connection works.' };
+
+  if (!GROQ_API_KEY) console.log('   Groq:    no GROQ_API_KEY set');
+  else {
+    const r = await rewriteWithGroq(probe, 'world');
+    console.log(`   Groq:    ${r.text ? '✅ working' : '❌ failed (see error above)'}  [model: ${GROQ_MODEL}]`);
+  }
+
+  if (GEMINI_API_KEYS.length === 0) console.log('   Gemini:  no GEMINI_API_KEY set');
+  else {
+    const r = await rewriteWithGemini(probe, 'world');
+    console.log(`   Gemini:  ${r.text ? '✅ working' : '❌ failed (see error above)'}  [${GEMINI_API_KEYS.length} key(s)]`);
+  }
+
+  if (!MISTRAL_API_KEY) console.log('   Mistral: no MISTRAL_API_KEY set');
+  else {
+    const r = await rewriteWithMistral(probe, 'world');
+    console.log(`   Mistral: ${r.text ? '✅ working' : '❌ failed (see error above)'}  [model: ${MISTRAL_MODEL}]`);
+  }
+  console.log('');
+}
+
 // ========== START SCHEDULE ==========
-mongoose.connection.once('open', () => {
-  console.log('📰 Initializing news fetcher (RSS, dedicated per category, Gemini rewrite)...');
+mongoose.connection.once('open', async () => {
+  console.log('📰 Initializing news fetcher (RSS, dedicated per category, AI rewrite)...');
+  await selfTestProviders().catch(e => console.error('Self-test error:', e.message));
   fetchAllNews().catch(console.error);
 
   setInterval(async () => {
