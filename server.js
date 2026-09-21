@@ -1,5 +1,5 @@
 // ════════════════════════════════════════════════════════════
-//  NEWZYY — RSS sources, per category
+//  NEWZYY — Guardian + diverse RSS sources, per category
 //  v2.1 — MongoDB storage, Gemini rewrite, fair round-robin
 // ════════════════════════════════════════════════════════════
 
@@ -36,31 +36,10 @@ const PORT = process.env.PORT || 3001;
 
 // ========== FRONTEND URL (for sitemap/rss absolute links) ==========
 const SITE_URL = process.env.SITE_URL || 'https://newzyy.site';
-// The frontend (SITE_URL) is a static site on GitHub Pages — it can't handle
-// API requests. Links that need to hit this backend directly (like the
-// one-click newsletter unsubscribe link inside emails) must point here instead.
-const BACKEND_URL = process.env.BACKEND_URL || 'https://newzyy.onrender.com';
 
 // ========== API KEYS ==========
-// Gemini now supports up to 5 keys, round-robin rotated — set GEMINI_API_KEY,
-// GEMINI_API_KEY_2, GEMINI_API_KEY_3, GEMINI_API_KEY_4, GEMINI_API_KEY_5 in
-// Render → Environment. Unset ones are simply skipped, so this still works
-// fine with just 1 key configured — nothing else needs to change either way.
-const GEMINI_API_KEYS = [
-  process.env.GEMINI_API_KEY,
-  process.env.GEMINI_API_KEY_2,
-  process.env.GEMINI_API_KEY_3,
-  process.env.GEMINI_API_KEY_4,
-  process.env.GEMINI_API_KEY_5
-].filter(Boolean);
-let geminiKeyRotationIndex = 0;
-// Picks the next key in the pool, round-robin — spreads calls evenly across
-// every configured key instead of hammering just the first one.
-function nextGeminiKey() {
-  const key = GEMINI_API_KEYS[geminiKeyRotationIndex % GEMINI_API_KEYS.length];
-  geminiKeyRotationIndex++;
-  return key;
-}
+const GUARDIAN_API_KEY = process.env.GUARDIAN_API_KEY || 'ab35f734-ceb0-4a49-bb7d-24c0c3331bd6';
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY; // set this in Render → Environment
 const JWT_SECRET = process.env.JWT_SECRET; // set this in Render → Environment — long random string
 const VERIFICATION_CODE_TTL_MIN = 15;
 
@@ -68,15 +47,12 @@ const VERIFICATION_CODE_TTL_MIN = 15;
 // defaults (its own error says "limit: 20"). Rather than guess a fixed pace, we read
 // Google's own suggested wait time from each 429 response and back off exactly that
 // long — self-adjusting to whatever the real limit is, never guessing wrong.
-const GEMINI_DELAY_MS = 4500;              // base spacing between successful calls (tightened from 6000 for faster throughput; 429 backoff still self-corrects if this is too aggressive)
+const GEMINI_DELAY_MS = 6000;              // base spacing between successful calls
 // Split so a busy rewrite cycle can never starve translation of quota (and vice
 // versa) — translation gets the bigger share since one article needs 9 translation
 // calls (one per language) but only 1 rewrite call.
-// Per-key daily budget stays the same as before (360 / 840) — these totals just
-// multiply by however many Gemini keys are actually configured (1 to 5), so
-// nothing else in the file needs to know how many keys there are.
-const GEMINI_REWRITE_MAX_PER_DAY = 360 * Math.max(GEMINI_API_KEYS.length, 1);
-const GEMINI_TRANSLATE_MAX_PER_DAY = 840 * Math.max(GEMINI_API_KEYS.length, 1);
+const GEMINI_REWRITE_MAX_PER_DAY = 360;
+const GEMINI_TRANSLATE_MAX_PER_DAY = 840;
 const GEMINI_MAX_ROUNDS_PER_CYCLE = 20;    // cap how many articles per category one cycle will attempt
 let geminiRewriteCallsToday = 0;
 let geminiTranslateCallsToday = 0;
@@ -86,7 +62,7 @@ let geminiDayStamp = new Date().toDateString();
 // Used as a fallback when Gemini's quota runs out — genuinely combines both
 // companies' free tiers rather than trying to bypass either one's limits.
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
-const GROQ_MODEL = 'openai/gpt-oss-20b'; // Groq deprecated llama-3.1-8b-instant on 2026-06-17; this is Groq's official recommended replacement
+const GROQ_MODEL = 'llama-3.1-8b-instant'; // most generous free-tier limits on Groq
 const GROQ_REWRITE_MAX_PER_DAY = 3600;
 const GROQ_TRANSLATE_MAX_PER_DAY = 8400;
 let groqRewriteCallsToday = 0;
@@ -102,38 +78,19 @@ let mistralRewriteCallsToday = 0;
 let mistralTranslateCallsToday = 0;
 let mistralDayStamp = new Date().toDateString();
 
-// ----- 429 handling: short cooldown, NOT a day-long ban -----
-// These APIs return 429 for two very different reasons: a per-minute rate
-// limit (clears in seconds) or a genuinely exhausted daily quota (clears at
-// midnight). Treating every 429 as "done for the day" is what previously
-// killed all three providers within the first cycle and made every single
-// article skip as "rewrite/quota" for the rest of the day.
-// So: by default a 429 just parks that provider for a short cooldown; only a
-// 429 whose message explicitly mentions a daily/per-day limit marks it as
-// exhausted until tomorrow.
-const PROVIDER_COOLDOWN_MS = 60 * 1000;
-const providerCooldownUntil = { gemini: 0, groq: 0, mistral: 0 };
-function providerAvailable(name) {
-  return Date.now() >= (providerCooldownUntil[name] || 0);
-}
-function coolDownProvider(name, retryAfterMs) {
-  providerCooldownUntil[name] = Date.now() + Math.max(retryAfterMs || 0, PROVIDER_COOLDOWN_MS);
-}
-// True only when the provider is telling us the DAILY allowance is gone.
-function isDailyQuotaMessage(message) {
-  const m = (message || '').toLowerCase();
-  return m.includes('per day') || m.includes('perday') || m.includes('daily')
-      || m.includes('per-day') || m.includes('requests per day');
-}
+// ----- Cerebras: fourth AI provider (rewrite fallback — free tier, OpenAI-compatible, very fast) -----
+const CEREBRAS_API_KEY = process.env.CEREBRAS_API_KEY;
+const CEREBRAS_MODEL = 'llama-3.3-70b';
+const CEREBRAS_MAX_PER_DAY = 800; // conservative — Cerebras free tier is generous, raise once confirmed on your account
+let cerebrasCallsToday = 0;
+let cerebrasDayStamp = new Date().toDateString();
 
-// Cerebras and Cohere were removed (previously the 4th/5th providers here).
-// Both turned out to be running on trial credits / a capped, non-commercial
-// "trial key" rather than a genuinely permanent free tier — Cerebras' free
-// credits run out and then require payment, and Cohere's trial key is capped
-// at ~1,000 calls/month and can be revoked since it's licensed for
-// non-commercial use only. Gemini, Groq, and Mistral are all confirmed
-// permanent, rate-limited (not credit-limited) free tiers with no card and no
-// expiry, which is what made the "quota exceeded" errors keep recurring.
+// ----- Cohere: fifth AI provider (rewrite fallback — free trial tier, Command R) -----
+const COHERE_API_KEY = process.env.COHERE_API_KEY;
+const COHERE_MODEL = 'command-r-08-2024';
+const COHERE_MAX_PER_DAY = 800; // Cohere trial keys are typically ~1000 calls/month — conservative daily slice
+let cohereCallsToday = 0;
+let cohereDayStamp = new Date().toDateString();
 
 // ========== TRANSLATION LANGUAGES ==========
 // Adding a new language later = add one line here. Nothing else needs to change.
@@ -172,7 +129,7 @@ mongoose.connect(MONGODB_URI)
   .catch(err => console.error('❌ MongoDB connection error:', err.message));
 
 app.use(cors({ origin: '*', methods: ['GET', 'POST', 'DELETE', 'PATCH', 'PUT', 'OPTIONS'], allowedHeaders: ['Content-Type', 'Authorization'] }));
-app.use(express.json({ limit: '8mb' })); // raised from Express's 100kb default to fit base64-encoded image uploads from the admin panel
+app.use(express.json());
 
 // ========== RATE LIMITING (protects auth + contact from abuse) ==========
 const authLimiter = rateLimit({
@@ -206,7 +163,7 @@ function requireAuth(req, res, next) {
 
 // ========== HEALTH CHECK ==========
 app.get('/', (req, res) => {
-  res.json({ status: 'ok', service: 'Newzyy (RSS, MongoDB, Auth)', time: new Date().toISOString() });
+  res.json({ status: 'ok', service: 'Newzyy (Guardian + diverse RSS, MongoDB, Auth)', time: new Date().toISOString() });
 });
 
 // ════════════════════════════════════════════════════════════
@@ -589,51 +546,9 @@ async function sendWelcomeDigest(email) {
     excerpt: a.excerpt,
     url: `${SITE_URL}/article/?id=${a.id}`
   }));
-  const ok = await sendNewsletterDigest(email, articlesForEmail, buildUnsubscribeUrl(email));
+  const ok = await sendNewsletterDigest(email, articlesForEmail);
   if (ok) await Subscriber.updateOne({ email }, { lastSentAt: new Date() });
 }
-
-// Signs an email into a short token so the one-click unsubscribe link in
-// newsletter emails can't be guessed/reused for someone else's address —
-// same HMAC approach, just scoped to this one purpose. Deterministic (no
-// expiry) so old emails' unsubscribe links keep working indefinitely.
-function buildUnsubscribeToken(email) {
-  return crypto.createHmac('sha256', JWT_SECRET || 'newzyy-fallback-secret')
-    .update(email.toLowerCase().trim())
-    .digest('hex')
-    .substring(0, 32);
-}
-function buildUnsubscribeUrl(email) {
-  return `${BACKEND_URL}/api/newsletter/unsubscribe?email=${encodeURIComponent(email)}&token=${buildUnsubscribeToken(email)}`;
-}
-
-function unsubscribePage(message, showHomeLink) {
-  return `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>Newzyy Newsletter</title></head>
-  <body style="font-family:Arial,sans-serif;max-width:440px;margin:70px auto;padding:24px;text-align:center;color:#1a1a1a;">
-    <div style="font-size:1.6rem;font-weight:900;margin-bottom:22px;">Newzy<span style="color:#b80000;">y</span></div>
-    <p style="font-size:1rem;line-height:1.5;">${message}</p>
-    ${showHomeLink ? `<a href="${SITE_URL}" style="display:inline-block;margin-top:18px;padding:11px 24px;background:#b80000;color:#fff;text-decoration:none;font-weight:700;border-radius:2px;">Back to Newzyy</a>` : ''}
-  </body></html>`;
-}
-
-// One-click unsubscribe — clicking the link in the email hits this directly,
-// no login or form needed. To re-subscribe, the same email address can just
-// be entered again in the newsletter box on the site.
-app.get('/api/newsletter/unsubscribe', async (req, res) => {
-  const email = (req.query.email || '').toString().toLowerCase().trim();
-  const token = (req.query.token || '').toString();
-
-  if (!email || !token || buildUnsubscribeToken(email) !== token) {
-    return res.status(400).send(unsubscribePage('This unsubscribe link is invalid or has expired.', true));
-  }
-  try {
-    await Subscriber.updateOne({ email }, { active: false });
-    res.send(unsubscribePage("You've been unsubscribed — you won't receive any more newsletter emails. Changed your mind? Just enter your email again in the newsletter box on the site to resubscribe anytime.", true));
-  } catch (e) {
-    res.status(500).send(unsubscribePage('Something went wrong. Please try again in a moment.', true));
-  }
-});
 
 app.post('/api/newsletter/unsubscribe', async (req, res) => {
   try {
@@ -665,7 +580,7 @@ async function sendDailyDigest() {
     const subscribers = await Subscriber.find({ active: true }).lean();
     let sent = 0;
     for (const sub of subscribers) {
-      const ok = await sendNewsletterDigest(sub.email, articlesForEmail, buildUnsubscribeUrl(sub.email));
+      const ok = await sendNewsletterDigest(sub.email, articlesForEmail);
       if (ok) {
         sent++;
         await Subscriber.updateOne({ _id: sub._id }, { lastSentAt: new Date() });
@@ -747,8 +662,7 @@ app.get('/api/admin/stats', async (req, res) => {
       perCategory,
       ai: {
         gemini: {
-          configured: GEMINI_API_KEYS.length > 0,
-          keysConfigured: GEMINI_API_KEYS.length,
+          configured: Boolean(GEMINI_API_KEY),
           rewrite: { callsToday: geminiRewriteCallsToday, maxPerDay: GEMINI_REWRITE_MAX_PER_DAY },
           translate: { callsToday: geminiTranslateCallsToday, maxPerDay: GEMINI_TRANSLATE_MAX_PER_DAY }
         },
@@ -761,7 +675,9 @@ app.get('/api/admin/stats', async (req, res) => {
           configured: Boolean(MISTRAL_API_KEY),
           rewrite: { callsToday: mistralRewriteCallsToday, maxPerDay: MISTRAL_REWRITE_MAX_PER_DAY },
           translate: { callsToday: mistralTranslateCallsToday, maxPerDay: MISTRAL_TRANSLATE_MAX_PER_DAY }
-        }
+        },
+        cerebras: { configured: Boolean(CEREBRAS_API_KEY), callsToday: cerebrasCallsToday, maxPerDay: CEREBRAS_MAX_PER_DAY, rewriteOnly: true },
+        cohere: { configured: Boolean(COHERE_API_KEY), callsToday: cohereCallsToday, maxPerDay: COHERE_MAX_PER_DAY, rewriteOnly: true }
       },
       // Kept for any older client still reading the old flat shape.
       gemini: { callsToday: geminiRewriteCallsToday + geminiTranslateCallsToday, maxPerDay: GEMINI_REWRITE_MAX_PER_DAY + GEMINI_TRANSLATE_MAX_PER_DAY },
@@ -809,167 +725,6 @@ app.patch('/api/admin/article/:id/toggle-breaking', async (req, res) => {
   }
 });
 
-// ----- Manually written articles (admin panel "Write Article" tab) -----
-// Everything else (RSS fetch → AI rewrite → auto-translate → publish) keeps
-// running exactly as before; this is a second, independent way for a human to
-// add an article directly, using the same Article model and the same
-// translation pipeline the automated system already uses, so manual articles
-// look and behave identically to auto-published ones on the site.
-app.post('/api/admin/article/manual', async (req, res) => {
-  if (!ADMIN_SECRET) return res.status(500).json({ success: false, message: 'ADMIN_SECRET not set on server' });
-  if (req.query.secret !== ADMIN_SECRET) return res.status(403).json({ success: false, message: 'Wrong secret' });
-  try {
-    const { title, category, excerpt, body, image, author, autoTranslate, manualBreaking } = req.body || {};
-
-    if (!title || !title.trim()) return res.status(400).json({ success: false, message: 'Title is required.' });
-    if (!body || !body.trim()) return res.status(400).json({ success: false, message: 'Body is required.' });
-    if (!category || !CATEGORIES.includes(category)) {
-      return res.status(400).json({ success: false, message: `Category must be one of: ${CATEGORIES.join(', ')}` });
-    }
-
-    // Body typed in the admin textarea is plain text with blank lines between
-    // paragraphs — wrap each paragraph in <p> so it renders exactly like every
-    // other article on the site (which all store body as <p>-wrapped HTML).
-    const bodyHtml = body.trim().split(/\n\s*\n/).map(p => `<p>${p.trim().replace(/\n/g, ' ')}</p>`).join('');
-    const excerptText = (excerpt && excerpt.trim()) || body.trim().substring(0, 200);
-
-    const imageCheck = await resolveImageFieldInput(image);
-    if (!imageCheck.ok) {
-      return res.status(400).json({ success: false, message: imageCheck.message });
-    }
-    const finalImage = imageCheck.value;
-
-    // Auto-translate into every active language, same as the automated
-    // pipeline — optional, but on by default so the article shows correctly
-    // across all language pages instead of only the default one.
-    let translations = {};
-    if (autoTranslate !== false) {
-      const englishDraft = { title: title.trim(), excerpt: excerptText, body: bodyHtml };
-      const translationResults = await Promise.all(
-        ACTIVE_LANGUAGES.map(async langCode => ({ langCode, result: await translateArticle(englishDraft, langCode) }))
-      );
-      for (const { langCode, result: tResult } of translationResults) {
-        if (tResult) translations[langCode] = { ...tResult, translatedAt: new Date() };
-      }
-    }
-
-    const created = await Article.create({
-      id: `manual_${Date.now()}_${Math.random().toString(36).substring(2, 10)}`,
-      category,
-      title: title.trim(),
-      excerpt: excerptText,
-      body: bodyHtml,
-      author: (author && author.trim()) || 'Newzyy Staff',
-      views: 0,
-      comments: 0,
-      image: finalImage,
-      imageAlt: title.trim(),
-      status: 'published',
-      source: 'Newzyy (manual)',
-      rewritten: true,
-      manualBreaking: Boolean(manualBreaking),
-      translations,
-      fetched_at: new Date()
-    });
-
-    res.json({
-      success: true,
-      message: `Article published. ${Object.keys(translations).length}/${ACTIVE_LANGUAGES.length} languages translated.`,
-      article: created
-    });
-  } catch (e) {
-    res.status(500).json({ success: false, message: e.message });
-  }
-});
-
-// ----- Edit an existing article (auto-published OR manual) -----
-// Previously only Delete existed for articles — no way to fix a typo or swap
-// a bad image without deleting and re-adding. Same fields as manual create;
-// leaving image/excerpt blank keeps the existing value. Retranslation is
-// opt-in (checkbox) so a small text fix doesn't burn AI quota by default.
-app.patch('/api/admin/article/:id', async (req, res) => {
-  if (!ADMIN_SECRET) return res.status(500).json({ success: false, message: 'ADMIN_SECRET not set on server' });
-  if (req.query.secret !== ADMIN_SECRET) return res.status(403).json({ success: false, message: 'Wrong secret' });
-  try {
-    const article = await Article.findOne({ id: req.params.id });
-    if (!article) return res.status(404).json({ success: false, message: 'Not found.' });
-
-    const { title, category, excerpt, body, image, author, manualBreaking, retranslate } = req.body || {};
-
-    if (category) {
-      if (!CATEGORIES.includes(category)) {
-        return res.status(400).json({ success: false, message: `Category must be one of: ${CATEGORIES.join(', ')}` });
-      }
-      article.category = category;
-    }
-    if (title && title.trim()) { article.title = title.trim(); article.imageAlt = title.trim(); }
-    if (typeof excerpt === 'string' && excerpt.trim()) article.excerpt = excerpt.trim();
-    if (typeof body === 'string' && body.trim()) {
-      article.body = body.trim().split(/\n\s*\n/).map(p => `<p>${p.trim().replace(/\n/g, ' ')}</p>`).join('');
-    }
-    if (typeof image === 'string' && image.trim()) {
-      const imageCheck = await resolveImageFieldInput(image.trim());
-      if (!imageCheck.ok) {
-        return res.status(400).json({ success: false, message: imageCheck.message });
-      }
-      article.image = imageCheck.value;
-    }
-    if (typeof author === 'string' && author.trim()) article.author = author.trim();
-    if (typeof manualBreaking === 'boolean') article.manualBreaking = manualBreaking;
-
-    let translateMsg = '';
-    if (retranslate) {
-      const englishDraft = { title: article.title, excerpt: article.excerpt, body: article.body };
-      const translationResults = await Promise.all(
-        ACTIVE_LANGUAGES.map(async langCode => ({ langCode, result: await translateArticle(englishDraft, langCode) }))
-      );
-      const translations = { ...article.translations };
-      let filled = 0;
-      for (const { langCode, result: tResult } of translationResults) {
-        if (tResult) { translations[langCode] = { ...tResult, translatedAt: new Date() }; filled++; }
-      }
-      article.translations = translations;
-      translateMsg = ` Re-translated ${filled}/${ACTIVE_LANGUAGES.length} languages.`;
-    }
-
-    await article.save();
-    res.json({ success: true, message: `Article updated.${translateMsg}`, article });
-  } catch (e) {
-    res.status(500).json({ success: false, message: e.message });
-  }
-});
-
-// ----- Fill in only the languages an article is still missing -----
-// Complements the "Translated X/9" badge already shown per article, which
-// previously had no action attached to it.
-app.post('/api/admin/article/:id/retranslate-missing', async (req, res) => {
-  if (!ADMIN_SECRET) return res.status(500).json({ success: false, message: 'ADMIN_SECRET not set on server' });
-  if (req.query.secret !== ADMIN_SECRET) return res.status(403).json({ success: false, message: 'Wrong secret' });
-  try {
-    const article = await Article.findOne({ id: req.params.id });
-    if (!article) return res.status(404).json({ success: false, message: 'Not found.' });
-
-    const have = new Set(Object.keys(article.translations || {}));
-    const missing = ACTIVE_LANGUAGES.filter(l => !have.has(l));
-    if (!missing.length) return res.json({ success: true, message: 'Already fully translated.', article });
-
-    const englishDraft = { title: article.title, excerpt: article.excerpt, body: article.body };
-    const translationResults = await Promise.all(
-      missing.map(async langCode => ({ langCode, result: await translateArticle(englishDraft, langCode) }))
-    );
-    const translations = { ...article.translations };
-    let filled = 0;
-    for (const { langCode, result: tResult } of translationResults) {
-      if (tResult) { translations[langCode] = { ...tResult, translatedAt: new Date() }; filled++; }
-    }
-    article.translations = translations;
-    await article.save();
-    res.json({ success: true, message: `Filled ${filled}/${missing.length} missing languages.`, article });
-  } catch (e) {
-    res.status(500).json({ success: false, message: e.message });
-  }
-});
-
 // ----- Contact messages: mark read + delete -----
 app.patch('/api/admin/contact/:id/read', async (req, res) => {
   if (!ADMIN_SECRET) return res.status(500).json({ success: false, message: 'ADMIN_SECRET not set on server' });
@@ -1011,8 +766,31 @@ const CATEGORIES = [
   'science', 'entertainment', 'travel', 'environment', 'culture', 'world', 'economy'
 ];
 
-// Every category has its own dedicated RSS feed — this is now the sole source
-// for every category (Guardian API removed).
+// Every category has its OWN dedicated Guardian query (never shares another
+// category's results) — either a specific section, or a free-text search when
+// no matching section exists. This is the primary source for every category.
+// FIX: ai / economy / entertainment must be `search`, not `section` — Guardian
+// "sections" are fixed single-word slugs (politics, sport, world...), not phrases
+// or boolean OR queries. Using `section` for those silently returns zero results.
+const GUARDIAN_CATEGORY_QUERY = {
+  politics: { section: 'politics' },
+  world: { section: 'world' },
+  technology: { section: 'technology' },
+  ai: { search: 'artificial intelligence' },
+  business: { section: 'business' },
+  economy: { search: 'economy OR economic OR inflation OR "interest rates"' },
+  health: { section: 'health' },
+  science: { section: 'science' },
+  environment: { section: 'environment' },
+  sports: { section: 'sport' },
+  entertainment: { search: 'entertainment OR celebrity OR film OR music OR television' },
+  culture: { section: 'culture' },
+  travel: { section: 'travel' }
+};
+
+// Secondary source for extra volume — official RSS feeds, one per category,
+// no API key needed. Only categories with a real matching feed are listed;
+// the rest rely on Guardian alone, which is enough on its own.
 const RSS_FEEDS = {
   politics: 'https://feeds.bbci.co.uk/news/politics/rss.xml',
   world: 'https://feeds.bbci.co.uk/news/world/rss.xml',
@@ -1090,7 +868,7 @@ app.get('/api/all-news', async (req, res) => {
     const page = Math.max(1, parseInt(req.query.page) || 1);
     const limit = Math.min(100, parseInt(req.query.limit) || 20);
     const filter = { status: 'published' };
-    if (req.query.category && CATEGORIES.includes(String(req.query.category))) filter.category = String(req.query.category);
+    if (req.query.category) filter.category = req.query.category;
     const lang = LANGUAGES[req.query.lang] ? req.query.lang : null;
     // Only show articles that actually HAVE this translation — no English fallback mixed in.
     if (lang) filter[`translations.${lang}`] = { $exists: true };
@@ -1165,21 +943,13 @@ app.get('/api/search', async (req, res) => {
     const q = (req.query.q || '').trim();
     if (q.length < 2) return res.json({ success: true, news: [] });
 
-    const lang = LANGUAGES[req.query.lang] ? req.query.lang : null;
     const regex = new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
-
-    const orClauses = [{ title: regex }, { excerpt: regex }, { category: regex }];
-    if (lang) {
-      orClauses.push({ [`translations.${lang}.title`]: regex });
-      orClauses.push({ [`translations.${lang}.excerpt`]: regex });
-    }
-
     const articles = await Article.find({
       status: 'published',
-      $or: orClauses
+      $or: [{ title: regex }, { excerpt: regex }, { category: regex }]
     }).sort({ fetched_at: -1 }).limit(30).lean();
 
-    res.json({ success: true, news: applyLanguageToList(attachLiveFields(articles), lang) });
+    res.json({ success: true, news: attachLiveFields(articles) });
   } catch (e) {
     console.error('search error:', e.message);
     res.json({ success: true, news: [] });
@@ -1283,7 +1053,58 @@ function stripHtml(html) {
     .trim();
 }
 
-// ========== SOURCE: RSS (dedicated feed per category, no key needed) ==========
+// ========== SOURCE 1: GUARDIAN (dedicated query per category) ==========
+async function fetchGuardianForCategory(cat) {
+  if (!GUARDIAN_API_KEY) return [];
+  const q = GUARDIAN_CATEGORY_QUERY[cat];
+  if (!q) return [];
+
+  const base = q.section
+    ? `section=${encodeURIComponent(q.section)}`
+    : `q=${encodeURIComponent(q.search)}`;
+  const url = `https://content.guardianapis.com/search?${base}&api-key=${GUARDIAN_API_KEY}&show-fields=body,thumbnail,trailText&show-elements=image&page-size=15&order-by=newest`;
+
+  try {
+    const response = await fetch(url);
+    const data = await response.json();
+    if (!data.response || !data.response.results) return [];
+
+    return data.response.results.map(a => {
+      // Guardian's fields.thumbnail is a tiny ~140x84 crop — too small to display well.
+      // The `elements` array (from show-elements=image) carries the real, full-size
+      // picture with multiple asset sizes. Pick the largest available one instead.
+      let image = a.fields?.thumbnail || '';
+      try {
+        const imageElement = (a.elements || []).find(el => el.type === 'image');
+        const assets = imageElement?.assets || [];
+        if (assets.length) {
+          const largest = assets.reduce((best, cur) => {
+            const w = parseInt(cur.typeData?.width) || 0;
+            const bw = parseInt(best?.typeData?.width) || 0;
+            return w > bw ? cur : best;
+          }, assets[0]);
+          if (largest?.file) image = largest.file;
+        }
+      } catch (e) { /* fall back to thumbnail — never fatal */ }
+
+      return {
+        title: a.webTitle || a.fields?.headline || 'Untitled',
+        description: stripHtml(a.fields?.trailText || ''),
+        body: stripHtml(a.fields?.body || ''),
+        url: a.webUrl || a.url,
+        image,
+        author: a.fields?.byline || a.sectionName || 'The Guardian',
+        publishedAt: a.webPublicationDate || new Date().toISOString(),
+        source: 'The Guardian'
+      };
+    });
+  } catch (e) {
+    console.error(`   ⚠️ Guardian fetch failed for ${cat}:`, e.message);
+    return []; // never throw — an empty array just means this source contributed nothing this cycle
+  }
+}
+
+// ========== SOURCE 2: RSS (dedicated feed per category, no key needed) ==========
 async function fetchRSS(cat) {
   const feedUrl = RSS_FEEDS[cat];
   if (!feedUrl) return [];
@@ -1314,15 +1135,19 @@ async function fetchRSS(cat) {
     });
   } catch (e) {
     console.error(`   ⚠️ RSS fetch failed for ${cat}:`, e.message);
-    return []; // never throw — this category simply contributes nothing this cycle
+    return []; // never throw — this category just falls back to Guardian-only this cycle
   }
 }
 
-// ========== FETCH ARTICLES FOR ONE CATEGORY (RSS only) ==========
-// Each category is fully independent — a failure in one category can never
-// affect any other category.
+// ========== COMBINE BOTH SOURCES FOR ONE CATEGORY ==========
+// Each category is fully independent — a failure in one source, or one category,
+// can never affect any other category.
 async function fetchCategorySources(cat) {
-  return await fetchRSS(cat);
+  const [guardianArticles, Articles] = await Promise.all([
+    fetchGuardianForCategory(cat),
+    fetchRSS(cat)
+  ]);
+  return [...guardianArticles, ...Articles];
 }
 
 // ========== IMAGE VALIDATION ==========
@@ -1333,27 +1158,6 @@ async function fetchCategorySources(cat) {
 const MIN_IMAGE_WIDTH = 300;
 const MIN_IMAGE_HEIGHT = 180;
 const MIN_IMAGE_BYTES = 4000; // filters out tiny placeholder/broken-icon images
-
-// ========== SENSITIVE CONTENT FILTER ==========
-// This pipeline auto-publishes with no human editorial review in the loop.
-// Sexual-offence court reporting carries real legal risk without one —
-// contempt of court on active trials, complainant-identification laws, and
-// defamation exposure if any AI-rewritten detail drifts from the source.
-// Safest approach here is to skip these stories from auto-publish entirely
-// rather than risk publishing an unreviewed account of one. This is
-// intentionally narrow (sexual-offence / abuse cases specifically) — it
-// does not block general crime, court, or legal-affairs reporting, which
-// carries much lower risk and is legitimate news coverage.
-const SENSITIVE_KEYWORDS = [
-  'sexual assault', 'sexually assault', 'indecent assault', 'sexual abuse',
-  'sexually abused', 'child abuse', 'child sexual', 'rape', 'raped', 'rapist',
-  'molest', 'pedophile', 'paedophile', 'grooming', 'sex offender',
-  'sex abuse', 'incest', 'complainant', 'victim testimony'
-];
-function isSensitiveContent(article) {
-  const text = `${article.title || ''} ${article.description || ''}`.toLowerCase();
-  return SENSITIVE_KEYWORDS.some(kw => text.includes(kw));
-}
 
 async function isGoodImage(url) {
   if (!url) return false;
@@ -1380,86 +1184,12 @@ async function isGoodImage(url) {
   }
 }
 
-// Validates an image the admin uploaded directly from the "Write Article"
-// panel — arrives as a base64 data URI (e.g. "data:image/png;base64,...."),
-// not a URL, so there's no network fetch involved: the bytes are already
-// right there in the request body. Stored as-is in the article's `image`
-// field (same as a URL would be) — the browser just renders a data URI the
-// same way it renders any other image src.
-const MAX_UPLOADED_IMAGE_BYTES = 5 * 1024 * 1024; // 5MB
-function validateUploadedImage(dataUri) {
-  const match = /^data:image\/(png|jpe?g|webp);base64,([A-Za-z0-9+/=]+)$/i.exec(dataUri || '');
-  if (!match) return { ok: false, message: 'Image must be a PNG, JPG, or WEBP file.' };
-  const approxBytes = Math.ceil((match[2].length * 3) / 4);
-  if (approxBytes > MAX_UPLOADED_IMAGE_BYTES) {
-    return { ok: false, message: 'Image is too large — please upload a file under 5MB.' };
-  }
-  return { ok: true };
-}
-// One field, two possible shapes: a browser-uploaded data URI (validated
-// locally, no network call) or a plain http(s) URL (validated by fetching it
-// with isGoodImage, kept for backward compatibility / editing older
-// articles that still have a URL-based image).
-async function resolveImageFieldInput(imageField) {
-  if (!imageField) return { ok: true, value: '' };
-  if (imageField.startsWith('data:image/')) {
-    const check = validateUploadedImage(imageField);
-    return check.ok ? { ok: true, value: imageField } : { ok: false, message: check.message };
-  }
-  const goodImage = await isGoodImage(imageField.trim());
-  if (!goodImage) {
-    return { ok: false, message: 'Image URL could not be verified — check the link is a direct, public image URL.' };
-  }
-  return { ok: true, value: imageField.trim() };
-}
-
-// ========== ARTICLE IMAGES ==========
-// Simple and reliable: use the image that came with the source RSS item
-// directly, as long as it's a real, decent-quality image — no re-hosting, no
-// external dependency, nothing that can become a single point of failure.
-// If the source had no usable image, the article is skipped and retried next
-// cycle — never published with a placeholder.
-
-// Anything below this size looks visibly blurry once displayed at the site's
-// article-card size — a small image stretched up to fill a large card is
-// what caused the blurry photos before. This bar keeps quality high without
-// needing to touch/re-process the image at all.
-const SOURCE_IMAGE_MIN_BYTES = 6000;
-const SOURCE_IMAGE_MIN_WIDTH = 480;
-const SOURCE_IMAGE_MIN_HEIGHT = 270;
-
-// Returns the original image URL if it's real and good quality, or null.
-async function getUsableArticleImage(url) {
-  if (!url) return null;
-  try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 6000);
-    const res = await fetch(url, { signal: controller.signal });
-    clearTimeout(timeout);
-
-    if (!res.ok) return null;
-    const contentType = res.headers.get('content-type') || '';
-    if (!contentType.startsWith('image/')) return null;
-
-    const buffer = await res.buffer();
-    if (buffer.length < SOURCE_IMAGE_MIN_BYTES) return null;
-
-    const dimensions = sizeOf(buffer);
-    if (!dimensions.width || !dimensions.height) return null;
-    if (dimensions.width < SOURCE_IMAGE_MIN_WIDTH || dimensions.height < SOURCE_IMAGE_MIN_HEIGHT) return null;
-
-    return url; // real, decent-quality image — use it exactly as the source published it
-  } catch (e) {
-    return null; // broken link, timeout, corrupt file — just means "no usable source image"
-  }
-}
-
 // ========== GEMINI REWRITE ==========
 // Takes the raw facts from the source APIs and asks Gemini to write an
 // original Newzyy article from them. Returns null text on any failure so the
 // caller can skip publishing (never breaks the pipeline).
 async function rewriteWithGemini(rawArticle, category) {
-  if (GEMINI_API_KEYS.length === 0) return { text: null, retryAfterMs: 0 };
+  if (!GEMINI_API_KEY) return { text: null, retryAfterMs: 0 };
 
   const sourceFacts = (rawArticle.body || rawArticle.description || '').substring(0, 3000);
   if (!sourceFacts.trim()) return { text: null, retryAfterMs: 0 };
@@ -1477,7 +1207,7 @@ ${sourceFacts}`;
 
   try {
     const res = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent?key=${nextGeminiKey()}`,
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
       {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -1495,8 +1225,7 @@ ${sourceFacts}`;
         if (!isNaN(seconds)) retryAfterMs = Math.min(Math.ceil(seconds * 1000), 70000); // cap at 70s, sanity limit
       }
       console.error(`   ⚠️ Gemini API error [${res.status}]:`, data.error?.message || JSON.stringify(data).substring(0, 300));
-      return { text: null, retryAfterMs, rateLimited: res.status === 429,
-               dailyExhausted: res.status === 429 && isDailyQuotaMessage(data.error?.message || JSON.stringify(data)) };
+      return { text: null, retryAfterMs };
     }
 
     const text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
@@ -1582,8 +1311,7 @@ ${sourceFacts}`;
       // Groq sends a Retry-After header on 429s — honor it if present.
       const retryAfter = res.headers.get('retry-after');
       const retryAfterMs = retryAfter ? Math.min(parseInt(retryAfter) * 1000, 70000) : 0;
-      return { text: null, retryAfterMs, rateLimited: res.status === 429,
-               dailyExhausted: res.status === 429 && isDailyQuotaMessage(data.error?.message || JSON.stringify(data)) };
+      return { text: null, retryAfterMs };
     }
 
     const text = data?.choices?.[0]?.message?.content;
@@ -1618,8 +1346,7 @@ async function rewriteWithMistral(rawArticle, category) {
       console.error(`   ⚠️ Mistral rewrite API error [${res.status}]:`, data.error?.message || JSON.stringify(data).substring(0, 300));
       const retryAfter = res.headers.get('retry-after');
       const retryAfterMs = retryAfter ? Math.min(parseInt(retryAfter) * 1000, 70000) : 0;
-      return { text: null, retryAfterMs, rateLimited: res.status === 429,
-               dailyExhausted: res.status === 429 && isDailyQuotaMessage(data.error?.message || JSON.stringify(data)) };
+      return { text: null, retryAfterMs };
     }
 
     const text = data?.choices?.[0]?.message?.content;
@@ -1632,44 +1359,121 @@ async function rewriteWithMistral(rawArticle, category) {
   }
 }
 
-// ========== COMBINED REWRITE: 3 providers in a fallback chain ==========
-// Genuinely combines three separate companies' free quotas — not multiple
+// ========== CEREBRAS REWRITE (fallback provider) ==========
+// OpenAI-compatible API, free tier, very fast inference.
+async function rewriteWithCerebras(rawArticle, category) {
+  if (!CEREBRAS_API_KEY) return { text: null, retryAfterMs: 0 };
+
+  const sourceFacts = (rawArticle.body || rawArticle.description || '').substring(0, 3000);
+  if (!sourceFacts.trim()) return { text: null, retryAfterMs: 0 };
+
+  try {
+    const res = await fetch('https://api.cerebras.ai/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${CEREBRAS_API_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: CEREBRAS_MODEL,
+        messages: [{ role: 'user', content: buildRewritePrompt(rawArticle, category, sourceFacts) }]
+      })
+    });
+    const data = await res.json();
+
+    if (!res.ok || data.error) {
+      console.error(`   ⚠️ Cerebras API error [${res.status}]:`, data.error?.message || JSON.stringify(data).substring(0, 300));
+      const retryAfter = res.headers.get('retry-after');
+      const retryAfterMs = retryAfter ? Math.min(parseInt(retryAfter) * 1000, 70000) : 0;
+      return { text: null, retryAfterMs };
+    }
+
+    const text = data?.choices?.[0]?.message?.content;
+    if (!text) return { text: null, retryAfterMs: 0 };
+    const clean = sanitizeArticleHtml(text.trim());
+    return { text: clean.length > 80 ? clean : null, retryAfterMs: 0 };
+  } catch (e) {
+    console.error('   ⚠️ Cerebras rewrite error:', e.message);
+    return { text: null, retryAfterMs: 0 };
+  }
+}
+
+// ========== COHERE REWRITE (fallback provider) ==========
+// Cohere's Chat v2 API — different request/response shape from the
+// OpenAI-style providers above, handled separately.
+async function rewriteWithCohere(rawArticle, category) {
+  if (!COHERE_API_KEY) return { text: null, retryAfterMs: 0 };
+
+  const sourceFacts = (rawArticle.body || rawArticle.description || '').substring(0, 3000);
+  if (!sourceFacts.trim()) return { text: null, retryAfterMs: 0 };
+
+  try {
+    const res = await fetch('https://api.cohere.com/v2/chat', {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${COHERE_API_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: COHERE_MODEL,
+        messages: [{ role: 'user', content: buildRewritePrompt(rawArticle, category, sourceFacts) }]
+      })
+    });
+    const data = await res.json();
+
+    if (!res.ok || data.error || data.message?.error) {
+      console.error(`   ⚠️ Cohere API error [${res.status}]:`, data.error?.message || JSON.stringify(data).substring(0, 300));
+      const retryAfter = res.headers.get('retry-after');
+      const retryAfterMs = retryAfter ? Math.min(parseInt(retryAfter) * 1000, 70000) : 0;
+      return { text: null, retryAfterMs };
+    }
+
+    const text = data?.message?.content?.[0]?.text;
+    if (!text) return { text: null, retryAfterMs: 0 };
+    const clean = sanitizeArticleHtml(text.trim());
+    return { text: clean.length > 80 ? clean : null, retryAfterMs: 0 };
+  } catch (e) {
+    console.error('   ⚠️ Cohere rewrite error:', e.message);
+    return { text: null, retryAfterMs: 0 };
+  }
+}
+
+// ========== COMBINED REWRITE: 5 providers in a fallback chain ==========
+// Genuinely combines five separate companies' free quotas — not multiple
 // accounts on the same service, which would risk violating any of their ToS.
-// All three (Gemini, Groq, Mistral) are confirmed permanent, rate-limited
-// free tiers — no trial credits, no expiry, no card. Groq is tried first:
-// it has by far the largest confirmed daily capacity and has proven the most
-// reliable in practice, so leading with it means the pipeline rarely needs to
-// fall through to the others at all.
-// Order: Groq → Gemini → Mistral. Stops at the first provider that returns
-// usable text; only moves to the next on quota exhaustion or an API error.
+// Order: Gemini → Groq → Mistral → Cerebras → Cohere. Stops at the first
+// provider that returns usable text; only moves to the next on quota
+// exhaustion or an API error.
 async function rewriteArticle(rawArticle, category) {
   checkGeminiDayReset();
   checkGroqDayReset();
   checkMistralDayReset();
+  checkCerebrasDayReset();
+  checkCohereDayReset();
 
-  if (GROQ_API_KEY && providerAvailable('groq') && groqRewriteCallsToday < GROQ_REWRITE_MAX_PER_DAY) {
-    const result = await rewriteWithGroq(rawArticle, category);
-    groqRewriteCallsToday++;
-    if (result.text) return { ...result, provider: 'groq' };
-    if (result.rateLimited) coolDownProvider('groq', result.retryAfterMs);
-    if (result.dailyExhausted) groqRewriteCallsToday = GROQ_REWRITE_MAX_PER_DAY;
-  }
-
-  if (GEMINI_API_KEYS.length > 0 && providerAvailable('gemini') && geminiRewriteCallsToday < GEMINI_REWRITE_MAX_PER_DAY) {
+  if (GEMINI_API_KEY && geminiRewriteCallsToday < GEMINI_REWRITE_MAX_PER_DAY) {
     const result = await rewriteWithGemini(rawArticle, category);
     geminiRewriteCallsToday++;
     if (result.text) return { ...result, provider: 'gemini' };
-    if (result.rateLimited) coolDownProvider('gemini', result.retryAfterMs);
-    if (result.dailyExhausted) geminiRewriteCallsToday = GEMINI_REWRITE_MAX_PER_DAY;
-    // Gemini failed (rate limit/error) — fall through to the next provider.
+    // Gemini failed (quota/error) — fall through to the next provider.
   }
 
-  if (MISTRAL_API_KEY && providerAvailable('mistral') && mistralRewriteCallsToday < MISTRAL_REWRITE_MAX_PER_DAY) {
+  if (GROQ_API_KEY && groqRewriteCallsToday < GROQ_REWRITE_MAX_PER_DAY) {
+    const result = await rewriteWithGroq(rawArticle, category);
+    groqRewriteCallsToday++;
+    if (result.text) return { ...result, provider: 'groq' };
+  }
+
+  if (MISTRAL_API_KEY && mistralRewriteCallsToday < MISTRAL_REWRITE_MAX_PER_DAY) {
     const result = await rewriteWithMistral(rawArticle, category);
     mistralRewriteCallsToday++;
     if (result.text) return { ...result, provider: 'mistral' };
-    if (result.rateLimited) coolDownProvider('mistral', result.retryAfterMs);
-    if (result.dailyExhausted) mistralRewriteCallsToday = MISTRAL_REWRITE_MAX_PER_DAY;
+  }
+
+  if (CEREBRAS_API_KEY && cerebrasCallsToday < CEREBRAS_MAX_PER_DAY) {
+    const result = await rewriteWithCerebras(rawArticle, category);
+    cerebrasCallsToday++;
+    if (result.text) return { ...result, provider: 'cerebras' };
+  }
+
+  if (COHERE_API_KEY && cohereCallsToday < COHERE_MAX_PER_DAY) {
+    const result = await rewriteWithCohere(rawArticle, category);
+    cohereCallsToday++;
+    if (result.text) return { ...result, provider: 'cohere' };
   }
 
   return { text: null, retryAfterMs: 0, provider: 'none' };
@@ -1687,6 +1491,22 @@ function checkMistralDayReset() {
     mistralDayStamp = today;
     mistralRewriteCallsToday = 0;
     mistralTranslateCallsToday = 0;
+  }
+}
+
+function checkCerebrasDayReset() {
+  const today = new Date().toDateString();
+  if (today !== cerebrasDayStamp) {
+    cerebrasDayStamp = today;
+    cerebrasCallsToday = 0;
+  }
+}
+
+function checkCohereDayReset() {
+  const today = new Date().toDateString();
+  if (today !== cohereDayStamp) {
+    cohereDayStamp = today;
+    cohereCallsToday = 0;
   }
 }
 
@@ -1719,10 +1539,10 @@ Body: ${(article.body || '').substring(0, 3000)}`;
 }
 
 async function translateWithGemini(article, langCode) {
-  if (GEMINI_API_KEYS.length === 0) return { data: null, rateLimited: false, dailyExhausted: false };
+  if (!GEMINI_API_KEY) return null;
   try {
     const res = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent?key=${nextGeminiKey()}`,
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
       {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -1730,21 +1550,17 @@ async function translateWithGemini(article, langCode) {
       }
     );
     const data = await res.json();
-    if (!res.ok || data.error) {
-      console.error(`   ⚠️ Gemini translate API error [${res.status}]:`, data.error?.message || JSON.stringify(data).substring(0, 300));
-      return { data: null, rateLimited: res.status === 429,
-               dailyExhausted: res.status === 429 && isDailyQuotaMessage(data.error?.message || JSON.stringify(data)) };
-    }
+    if (!res.ok || data.error) return null;
     const text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
-    return { data: parseTranslationJSON(text), rateLimited: false, dailyExhausted: false };
+    return parseTranslationJSON(text);
   } catch (e) {
     console.error('   ⚠️ Gemini translate error:', e.message);
-    return { data: null, rateLimited: false, dailyExhausted: false };
+    return null;
   }
 }
 
 async function translateWithGroq(article, langCode) {
-  if (!GROQ_API_KEY) return { data: null, rateLimited: false, dailyExhausted: false };
+  if (!GROQ_API_KEY) return null;
   try {
     const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
       method: 'POST',
@@ -1755,20 +1571,16 @@ async function translateWithGroq(article, langCode) {
       })
     });
     const data = await res.json();
-    if (!res.ok || data.error) {
-      console.error(`   ⚠️ Groq translate API error [${res.status}]:`, data.error?.message || JSON.stringify(data).substring(0, 300));
-      return { data: null, rateLimited: res.status === 429,
-               dailyExhausted: res.status === 429 && isDailyQuotaMessage(data.error?.message || JSON.stringify(data)) };
-    }
-    return { data: parseTranslationJSON(data?.choices?.[0]?.message?.content), rateLimited: false, dailyExhausted: false };
+    if (!res.ok || data.error) return null;
+    return parseTranslationJSON(data?.choices?.[0]?.message?.content);
   } catch (e) {
     console.error('   ⚠️ Groq translate error:', e.message);
-    return { data: null, rateLimited: false, dailyExhausted: false };
+    return null;
   }
 }
 
 async function translateWithMistral(article, langCode) {
-  if (!MISTRAL_API_KEY) return { data: null, rateLimited: false, dailyExhausted: false };
+  if (!MISTRAL_API_KEY) return null;
   try {
     const res = await fetch('https://api.mistral.ai/v1/chat/completions', {
       method: 'POST',
@@ -1779,15 +1591,11 @@ async function translateWithMistral(article, langCode) {
       })
     });
     const data = await res.json();
-    if (!res.ok || data.error) {
-      console.error(`   ⚠️ Mistral translate API error [${res.status}]:`, data.error?.message || JSON.stringify(data).substring(0, 300));
-      return { data: null, rateLimited: res.status === 429,
-               dailyExhausted: res.status === 429 && isDailyQuotaMessage(data.error?.message || JSON.stringify(data)) };
-    }
-    return { data: parseTranslationJSON(data?.choices?.[0]?.message?.content), rateLimited: false, dailyExhausted: false };
+    if (!res.ok || data.error) return null;
+    return parseTranslationJSON(data?.choices?.[0]?.message?.content);
   } catch (e) {
     console.error('   ⚠️ Mistral translate error:', e.message);
-    return { data: null, rateLimited: false, dailyExhausted: false };
+    return null;
   }
 }
 
@@ -1796,26 +1604,20 @@ async function translateArticle(article, langCode) {
   checkGroqDayReset();
   checkMistralDayReset();
 
-  if (GROQ_API_KEY && providerAvailable('groq') && groqTranslateCallsToday < GROQ_TRANSLATE_MAX_PER_DAY) {
-    groqTranslateCallsToday++;
-    const { data, rateLimited, dailyExhausted } = await translateWithGroq(article, langCode);
-    if (data) return data;
-    if (rateLimited) coolDownProvider('groq', 0);
-    if (dailyExhausted) groqTranslateCallsToday = GROQ_TRANSLATE_MAX_PER_DAY;
-  }
-  if (GEMINI_API_KEYS.length > 0 && providerAvailable('gemini') && geminiTranslateCallsToday < GEMINI_TRANSLATE_MAX_PER_DAY) {
+  if (GEMINI_API_KEY && geminiTranslateCallsToday < GEMINI_TRANSLATE_MAX_PER_DAY) {
     geminiTranslateCallsToday++;
-    const { data, rateLimited, dailyExhausted } = await translateWithGemini(article, langCode);
-    if (data) return data;
-    if (rateLimited) coolDownProvider('gemini', 0);
-    if (dailyExhausted) geminiTranslateCallsToday = GEMINI_TRANSLATE_MAX_PER_DAY;
+    const result = await translateWithGemini(article, langCode);
+    if (result) return result;
   }
-  if (MISTRAL_API_KEY && providerAvailable('mistral') && mistralTranslateCallsToday < MISTRAL_TRANSLATE_MAX_PER_DAY) {
+  if (GROQ_API_KEY && groqTranslateCallsToday < GROQ_TRANSLATE_MAX_PER_DAY) {
+    groqTranslateCallsToday++;
+    const result = await translateWithGroq(article, langCode);
+    if (result) return result;
+  }
+  if (MISTRAL_API_KEY && mistralTranslateCallsToday < MISTRAL_TRANSLATE_MAX_PER_DAY) {
     mistralTranslateCallsToday++;
-    const { data, rateLimited, dailyExhausted } = await translateWithMistral(article, langCode);
-    if (data) return data;
-    if (rateLimited) coolDownProvider('mistral', 0);
-    if (dailyExhausted) mistralTranslateCallsToday = MISTRAL_TRANSLATE_MAX_PER_DAY;
+    const result = await translateWithMistral(article, langCode);
+    if (result) return result;
   }
   return null;
 }
@@ -1845,7 +1647,7 @@ async function runTranslationCycle() {
           );
           succeeded++;
         }
-        await new Promise(r => setTimeout(r, 2000));
+        await new Promise(r => setTimeout(r, 2500));
       }
     }
   } catch (e) {
@@ -1857,7 +1659,7 @@ async function runTranslationCycle() {
 
 // ========== MAIN FETCH FUNCTION (MongoDB, fair round-robin across all categories) ==========
 async function fetchAllNews() {
-  console.log(`\n🔄 [${new Date().toLocaleTimeString()}] Starting news fetch (RSS, per category)...`);
+  console.log(`\n🔄 [${new Date().toLocaleTimeString()}] Starting news fetch (Guardian + diverse RSS, per category)...`);
   checkGeminiDayReset();
 
   // Load existing titles once, so we don't hit the DB per-article inside the loop.
@@ -1885,7 +1687,7 @@ async function fetchAllNews() {
   // Every category gets a turn before any category gets a second turn, so if
   // the Gemini budget runs out mid-cycle, every category already had a fair share.
   const stats = {};
-  CATEGORIES.forEach(c => (stats[c] = { added: 0, fetchedImage: 0, skippedImage: 0, skippedNoProvider: 0, skippedRewrite: 0, skippedTranslate: 0, skippedSensitive: 0 }));
+  CATEGORIES.forEach(c => (stats[c] = { added: 0, skippedImage: 0, skippedGemini: 0 }));
 
   let totalNew = 0;
   let round = 0;
@@ -1902,31 +1704,34 @@ async function fetchAllNews() {
       const titleLower = article.title.toLowerCase();
       if (existingTitles.has(titleLower)) continue; // could have been added by an earlier round this same cycle
 
-      // ----- Sensitive content check (cheapest check, do it first) -----
-      if (isSensitiveContent(article)) {
-        stats[cat].skippedSensitive++;
+      // ----- Image check first (cheap, saves wasting a Gemini call on articles we'd reject anyway) -----
+      const hasGoodImage = await isGoodImage(article.image);
+      if (!hasGoodImage) {
+        stats[cat].skippedImage++;
         continue;
       }
 
-      // ----- AI rewrite: Groq → Gemini → Mistral -----
+      // ----- AI rewrite: Gemini → Groq → Mistral → Cerebras → Cohere -----
       const noProviderLeft =
-        (GEMINI_API_KEYS.length === 0 || geminiRewriteCallsToday >= GEMINI_REWRITE_MAX_PER_DAY) &&
+        (!GEMINI_API_KEY || geminiRewriteCallsToday >= GEMINI_REWRITE_MAX_PER_DAY) &&
         (!GROQ_API_KEY || groqRewriteCallsToday >= GROQ_REWRITE_MAX_PER_DAY) &&
-        (!MISTRAL_API_KEY || mistralRewriteCallsToday >= MISTRAL_REWRITE_MAX_PER_DAY);
+        (!MISTRAL_API_KEY || mistralRewriteCallsToday >= MISTRAL_REWRITE_MAX_PER_DAY) &&
+        (!CEREBRAS_API_KEY || cerebrasCallsToday >= CEREBRAS_MAX_PER_DAY) &&
+        (!COHERE_API_KEY || cohereCallsToday >= COHERE_MAX_PER_DAY);
       if (noProviderLeft) {
-        stats[cat].skippedNoProvider++;
+        stats[cat].skippedGemini++;
         continue;
       }
 
       const result = await rewriteArticle(article, cat);
 
       if (!result.text) {
-        stats[cat].skippedRewrite++;
+        stats[cat].skippedGemini++;
         await new Promise(r => setTimeout(r, result.retryAfterMs || GEMINI_DELAY_MS));
         continue;
       }
 
-      await new Promise(r => setTimeout(r, result.provider === 'groq' ? 2000 : GEMINI_DELAY_MS));
+      await new Promise(r => setTimeout(r, result.provider === 'groq' ? 2500 : GEMINI_DELAY_MS));
 
       // ----- Translate into every active language IN PARALLEL before publishing -----
       // Nothing goes live (not even English) until every language succeeds. If any
@@ -1948,21 +1753,9 @@ async function fetchAllNews() {
       }
 
       if (!allTranslationsOk) {
-        const failedLangs = translationResults.filter(r => !r.result).map(r => r.langCode);
-        console.error(`   ⚠️ ${cat}: translation failed for [${failedLangs.join(', ')}] — article skipped, will retry next cycle`);
-        stats[cat].skippedTranslate++; // counted as a skip — will retry as a "new" article next cycle
+        stats[cat].skippedGemini++; // counted as a skip — will retry as a "new" article next cycle
         continue;
       }
-
-      // ----- Use the source's own image directly if it's real and decent
-      // quality. If not, skip and retry next cycle — never publish with a
-      // placeholder or a re-hosted/altered version. -----
-      const imageUrl = await getUsableArticleImage(article.image);
-      if (!imageUrl) {
-        stats[cat].skippedImage++; // will retry as a "new" article next cycle
-        continue;
-      }
-      stats[cat].fetchedImage++;
 
       try {
         await Article.create({
@@ -1974,7 +1767,7 @@ async function fetchAllNews() {
           author: 'Newzyy Staff',
           views: Math.floor(Math.random() * 5000) + 100,
           comments: Math.floor(Math.random() * 200),
-          image: imageUrl,
+          image: article.image,
           imageAlt: article.title,
           status: 'published',
           // Kept internally for editorial record-keeping only — not shown on the site.
@@ -1998,7 +1791,7 @@ async function fetchAllNews() {
 
   CATEGORIES.forEach(cat => {
     const s = stats[cat];
-    console.log(`   ✅ ${cat}: ${s.added} added (${s.fetchedImage} with fetched image), skipped → ${s.skippedRewrite} rewrite-failed, ${s.skippedTranslate} translate-failed, ${s.skippedNoProvider} no-provider-left, ${s.skippedImage} no-usable-image, ${s.skippedSensitive} sensitive`);
+    console.log(`   ✅ ${cat}: ${s.added} added, ${s.skippedImage} skipped (bad/missing image), ${s.skippedGemini} skipped (rewrite/quota)`);
   });
 
   // Retention: 90 days, not 3 — permanent-ish URLs matter for SEO and social shares.
@@ -2014,10 +1807,12 @@ async function fetchAllNews() {
   }
 
   console.log(`\n📊 SUMMARY: +${totalNew} new articles this cycle`);
-  console.log(`   Gemini keys configured: ${GEMINI_API_KEYS.length > 0 ? GEMINI_API_KEYS.length : 'NONE — set GEMINI_API_KEY in Render, nothing will publish without it'}`);
+  console.log(`   Gemini key configured: ${GEMINI_API_KEY ? 'YES' : 'NO — set GEMINI_API_KEY in Render, nothing will publish without it'}`);
   console.log(`   Gemini — rewrite: ${geminiRewriteCallsToday}/${GEMINI_REWRITE_MAX_PER_DAY}, translate: ${geminiTranslateCallsToday}/${GEMINI_TRANSLATE_MAX_PER_DAY}`);
   console.log(`   Groq key configured: ${GROQ_API_KEY ? 'YES' : 'NO'} — rewrite: ${groqRewriteCallsToday}/${GROQ_REWRITE_MAX_PER_DAY}, translate: ${groqTranslateCallsToday}/${GROQ_TRANSLATE_MAX_PER_DAY}`);
   console.log(`   Mistral key configured: ${MISTRAL_API_KEY ? 'YES' : 'NO'} — rewrite: ${mistralRewriteCallsToday}/${MISTRAL_REWRITE_MAX_PER_DAY}, translate: ${mistralTranslateCallsToday}/${MISTRAL_TRANSLATE_MAX_PER_DAY}`);
+  console.log(`   Cerebras key configured: ${CEREBRAS_API_KEY ? 'YES' : 'NO'} — Cerebras calls used today: ${cerebrasCallsToday}/${CEREBRAS_MAX_PER_DAY}`);
+  console.log(`   Cohere key configured: ${COHERE_API_KEY ? 'YES' : 'NO'} — Cohere calls used today: ${cohereCallsToday}/${COHERE_MAX_PER_DAY}`);
   console.log(`✅ Fetch completed at ${new Date().toLocaleTimeString()}\n`);
 }
 
@@ -2107,66 +1902,35 @@ app.get('/api/admin/translation-coverage', async (req, res) => {
   }
 });
 
-// ========== PROVIDER SELF-TEST ==========
-// Runs once at boot. Makes one tiny call per provider and prints exactly what
-// came back, so a misconfigured key or a model name the provider has since
-// retired shows up immediately and unambiguously in the logs — instead of
-// silently turning into "every article skipped" hours later.
-async function selfTestProviders() {
-  console.log('\n🔍 Provider self-test:');
-  const probe = { title: 'Test', description: 'A short test sentence used only to verify the API connection works.', body: 'A short test sentence used only to verify the API connection works.' };
-
-  if (!GROQ_API_KEY) console.log('   Groq:    no GROQ_API_KEY set');
-  else {
-    const r = await rewriteWithGroq(probe, 'world');
-    console.log(`   Groq:    ${r.text ? '✅ working' : '❌ failed (see error above)'}  [model: ${GROQ_MODEL}]`);
-  }
-
-  if (GEMINI_API_KEYS.length === 0) console.log('   Gemini:  no GEMINI_API_KEY set');
-  else {
-    const r = await rewriteWithGemini(probe, 'world');
-    console.log(`   Gemini:  ${r.text ? '✅ working' : '❌ failed (see error above)'}  [${GEMINI_API_KEYS.length} key(s)]`);
-  }
-
-  if (!MISTRAL_API_KEY) console.log('   Mistral: no MISTRAL_API_KEY set');
-  else {
-    const r = await rewriteWithMistral(probe, 'world');
-    console.log(`   Mistral: ${r.text ? '✅ working' : '❌ failed (see error above)'}  [model: ${MISTRAL_MODEL}]`);
-  }
-  console.log('');
-}
-
 // ========== START SCHEDULE ==========
-mongoose.connection.once('open', async () => {
-  console.log('📰 Initializing news fetcher (RSS, dedicated per category, AI rewrite)...');
-  await selfTestProviders().catch(e => console.error('Self-test error:', e.message));
+mongoose.connection.once('open', () => {
+  console.log('📰 Initializing news fetcher (Guardian + diverse RSS, dedicated per category, Gemini rewrite)...');
   fetchAllNews().catch(console.error);
 
   setInterval(async () => {
     console.log('⏰ Scheduled news fetch...');
     await fetchAllNews().catch(console.error);
-  }, 30 * 60 * 1000); // tightened from every 6h to every 30min for fresher news
+  }, 6 * 60 * 60 * 1000);
 
   // Newsletter digest — once every 24 hours.
   setInterval(async () => {
     await sendDailyDigest().catch(console.error);
   }, 24 * 60 * 60 * 1000);
 
-  // Translation cycle — every 30 minutes (tightened from every 2h), starting 5
-  // minutes after boot so it doesn't compete with the initial news fetch for
-  // AI quota at the same instant.
+  // Translation cycle — every 2 hours, starting 20 minutes after boot so it
+  // doesn't compete with the initial news fetch for AI quota at the same instant.
   setTimeout(() => {
     runTranslationCycle().catch(console.error);
     setInterval(async () => {
       await runTranslationCycle().catch(console.error);
-    }, 30 * 60 * 1000);
-  }, 5 * 60 * 1000);
+    }, 2 * 60 * 60 * 1000);
+  }, 20 * 60 * 1000);
 });
 
 // ========== START SERVER ==========
 app.listen(PORT, () => {
   console.log(`\n🚀 Server running on port ${PORT}`);
-  console.log(`   🔥 RSS per category, Gemini-rewritten, MongoDB storage`);
+  console.log(`   🔥 Guardian + diverse RSS per category, Gemini-rewritten, MongoDB storage`);
   console.log(`   GET  /api/all-news?page=1&limit=20&category=technology`);
   console.log(`   GET  /api/article/:id`);
   console.log(`   GET  /api/category/:slug`);
